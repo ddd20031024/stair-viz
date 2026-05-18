@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>楼梯检测机器人 · 上位机监控</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f1117;
+  --card-bg: #1a1d27;
+  --border: #2a2d37;
+  --text: #c8ccd4;
+  --text-dim: #6b7080;
+  --green: #22c55e;
+  --yellow: #eab308;
+  --red: #ef4444;
+  --blue: #3b82f6;
+  --purple: #a855f7;
+  --cyan: #06b6d4;
+  --orange: #f97316;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding: 12px;
+}
+
+/* ---- top bar ---- */
+.top-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--card-bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 20px; margin-bottom: 12px;
+}
+.top-bar .title {
+  font-size: 18px; font-weight: 700; letter-spacing: 1px;
+  display: flex; align-items: center; gap: 8px;
+}
+.top-bar .title .dot { width: 10px; height: 10px; border-radius: 50%; }
+.top-bar .title .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.top-bar .title .dot.off { background: var(--red); box-shadow: 0 0 6px var(--red); }
+.top-bar .info { display: flex; gap: 20px; font-size: 13px; color: var(--text-dim); }
+.top-bar .info span { color: var(--text); font-weight: 600; }
+
+/* ---- grid layout ---- */
+.grid { display: grid; gap: 12px; }
+/* row 1: 3 cards */
+.row1 { grid-template-columns: 1fr 1fr 1fr; }
+/* row 2: motors full width */
+.row2 { grid-template-columns: 1fr; }
+/* row 3: triwheel + events */
+.row3 { grid-template-columns: 1fr 1fr; }
+
+/* ---- card ---- */
+.card {
+  background: var(--card-bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 14px 18px;
+}
+.card h2 {
+  font-size: 13px; font-weight: 600; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 1px;
+  margin-bottom: 12px; border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+
+/* ---- safety panel ---- */
+.safety-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.safety-item {
+  display: flex; flex-direction: column; gap: 2px;
+}
+.safety-item .label { font-size: 11px; color: var(--text-dim); }
+.safety-item .value { font-size: 20px; font-weight: 700; }
+.safety-item .value.mode-SAFE { color: var(--green); }
+.safety-item .value.mode-OPEN_LOOP { color: var(--yellow); }
+.safety-item .value.mode-CLOSED_LOOP { color: var(--blue); }
+.safety-item .value.mode-SLAVE { color: var(--purple); }
+.safety-item .value.warn { color: var(--yellow); }
+.safety-item .value.danger { color: var(--red); }
+
+.error-flags { margin-top: 8px; }
+.error-flags .label { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
+.error-flags .flags { display: flex; flex-wrap: wrap; gap: 4px; }
+.error-flag {
+  font-size: 10px; padding: 2px 6px; border-radius: 3px;
+  background: #1f2233; color: var(--text-dim);
+  border: 1px solid #2a2d37;
+}
+.error-flag.active { background: #3b1114; color: var(--red); border-color: #5c1a1a; }
+
+/* ---- tof panel ---- */
+.tof-bars { display: flex; gap: 12px; height: 140px; align-items: flex-end; }
+.tof-bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.tof-bar { width: 100%; border-radius: 4px 4px 0 0; transition: height 0.1s, background 0.3s; min-height: 4px; position: relative; }
+.tof-bar.valid { background: linear-gradient(0deg, #22c55e88, #22c55e); }
+.tof-bar.weak { background: linear-gradient(0deg, #eab30888, #eab308); }
+.tof-bar.invalid { background: #ef444455; }
+.tof-bar.overflow { background: #6b708055; }
+.tof-val { font-size: 13px; font-weight: 700; }
+.tof-label { font-size: 10px; color: var(--text-dim); }
+
+/* ---- imu panel ---- */
+.imu-row { display: flex; gap: 16px; align-items: center; }
+.horizon-container { position: relative; width: 130px; height: 130px; flex-shrink: 0; }
+.horizon-container canvas { width: 130px; height: 130px; }
+.imu-values { display: flex; flex-direction: column; gap: 8px; }
+.imu-val { display: flex; justify-content: space-between; gap: 16px; font-size: 13px; }
+.imu-val .name { color: var(--text-dim); }
+.imu-val .num { font-weight: 700; }
+
+/* ---- motors panel ---- */
+.motors-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
+.motor-card {
+  background: #141720; border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px; text-align: center;
+}
+.motor-card.offline { opacity: 0.5; }
+.motor-name { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
+.motor-rpm { font-size: 18px; font-weight: 700; }
+.motor-bar-wrap { height: 6px; background: #2a2d37; border-radius: 3px; margin: 4px 0; overflow: hidden; }
+.motor-bar { height: 100%; border-radius: 3px; background: var(--blue); transition: width 0.2s; }
+.motor-info { font-size: 10px; color: var(--text-dim); }
+
+/* ---- triwheel panel ---- */
+.wheels-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.wheel-item {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 8px; background: #141720; border-radius: 4px;
+}
+.wheel-name { font-size: 12px; color: var(--text-dim); }
+.wheel-angles { text-align: right; }
+.wheel-angle { font-size: 16px; font-weight: 700; }
+.wheel-filtered { font-size: 11px; color: var(--text-dim); }
+
+/* ---- events panel ---- */
+.event-log { max-height: 200px; overflow-y: auto; font-size: 12px; }
+.event-item { padding: 4px 0; border-bottom: 1px solid #1f2233; display: flex; gap: 8px; align-items: baseline; }
+.event-time { color: var(--text-dim); white-space: nowrap; font-size: 11px; }
+.event-tag {
+  font-size: 10px; padding: 1px 5px; border-radius: 3px; white-space: nowrap;
+  background: #1f2233; color: var(--cyan);
+}
+.event-tag.error { background: #3b1114; color: var(--red); }
+.event-tag.mode { background: #0c1a2b; color: var(--blue); }
+.event-desc { color: var(--text); }
+
+/* ---- scrollbar ---- */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a2d37; border-radius: 2px; }
+
+@media (max-width: 900px) {
+  .row1 { grid-template-columns: 1fr; }
+  .motors-grid { grid-template-columns: repeat(3, 1fr); }
+  .row3 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ============================== Top Bar ============================== -->
+<div class="top-bar">
+  <div class="title">
+    <span class="dot off" id="conn-dot"></span>
+    <span>楼梯检测机器人 · 上位机监控</span>
+  </div>
+  <div class="info">
+    帧率 <span id="fps">0</span> Hz &nbsp;|&nbsp;
+    总帧数 <span id="total-frames">0</span> &nbsp;|&nbsp;
+    模式 <span id="mode-text" style="color:var(--blue)">--</span>
+  </div>
+</div>
+
+<!-- ============================== Row 1: Safety + TOF + IMU ============================== -->
+<div class="grid row1">
+
+  <!-- Safety -->
+  <div class="card">
+    <h2>安全状态</h2>
+    <div class="safety-grid">
+      <div class="safety-item">
+        <span class="label">底盘模式</span>
+        <span class="value" id="s-mode">--</span>
+      </div>
+      <div class="safety-item">
+        <span class="label">连接状态</span>
+        <span class="value" id="s-conn">--</span>
+      </div>
+      <div class="safety-item">
+        <span class="label">TOF 最小距离</span>
+        <span class="value" id="s-tof-min">--</span>
+      </div>
+      <div class="safety-item">
+        <span class="label">TOF 有效数</span>
+        <span class="value" id="s-tof-valid">--</span>
+      </div>
+    </div>
+    <div class="error-flags">
+      <div class="label">错误标志</div>
+      <div class="flags" id="error-flags"></div>
+    </div>
+  </div>
+
+  <!-- TOF -->
+  <div class="card">
+    <h2>TOF 测距 (mm)</h2>
+    <div class="tof-bars" id="tof-bars"></div>
+  </div>
+
+  <!-- IMU -->
+  <div class="card">
+    <h2>IMU 姿态</h2>
+    <div class="imu-row">
+      <div class="horizon-container">
+        <canvas id="horizon" width="130" height="130"></canvas>
+      </div>
+      <div class="imu-values">
+        <div class="imu-val"><span class="name">Pitch</span><span class="num" id="imu-pitch">0.0°</span></div>
+        <div class="imu-val"><span class="name">Roll</span><span class="num" id="imu-roll">0.0°</span></div>
+        <div class="imu-val"><span class="name">底盘俯仰</span><span class="num" id="imu-chassis">0.0°</span></div>
+        <div class="imu-val"><span class="name">温度</span><span class="num" id="imu-temp">0.0°C</span></div>
+        <div class="imu-val"><span class="name">TOF 最大</span><span class="num" id="imu-tof-max">0 mm</span></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ============================== Row 2: FOC Motors ============================== -->
+<div class="grid row2">
+  <div class="card">
+    <h2>FOC 电机状态</h2>
+    <div class="motors-grid" id="motors-grid"></div>
+  </div>
+</div>
+
+<!-- ============================== Row 3: Triwheels + Events ============================== -->
+<div class="grid row3">
+
+  <!-- Triwheels -->
+  <div class="card">
+    <h2>三角轮角度</h2>
+    <div class="wheels-grid" id="wheels-grid"></div>
+    <div style="margin-top:8px;font-size:12px;color:var(--text-dim);text-align:right;">
+      底盘俯仰（三角轮）: <span style="color:var(--text);font-weight:700;" id="tw-pitch">0.0°</span>
+    </div>
+  </div>
+
+  <!-- Events -->
+  <div class="card">
+    <h2>事件日志</h2>
+    <div class="event-log" id="event-log">
+      <div style="color:var(--text-dim);">等待数据...</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ============================== WebSocket ==============================
+const MODE_NAMES = {0:'安全', 1:'开环', 2:'闭环', 3:'从机'};
+const MODE_CLASSES = {0:'mode-SAFE', 1:'mode-OPEN_LOOP', 2:'mode-CLOSED_LOOP', 3:'mode-SLAVE'};
+const ERROR_NAMES = ['急停','IMU故障','FOC故障','DRV故障','TOF故障','DBUS断连','过温','电压异常','三角轮故障'];
+const TOF_STATUS_CLASSES = {0:'invalid', 1:'valid', 2:'weak', 3:'overflow'};
+
+let prevTime = 0, prevTotal = 0;
+let eventCount = 0;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onopen = () => console.log('WebSocket connected');
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'state_snapshot') {
+        updateUI(msg.data);
+        updateFPS(msg.timestamp);
+      } else if (msg.type === 'event') {
+        addEvent(msg.data);
+      }
+    } catch (ex) {}
+  };
+  ws.onclose = () => setTimeout(connect, 2000);
+  ws.onerror = () => ws.close();
+}
+
+// ============================== FPS Counter ==============================
+function updateFPS(ts) {
+  const el = document.getElementById('fps');
+  if (prevTime && prevTotal) {
+    const dt = ts - prevTime;
+    const df = 1; // each snapshot ≈ 1 frame worth
+    if (dt > 0.5) {
+      const fps = Math.round(1 / (dt));
+      el.textContent = fps;
+      prevTime = ts;
+    }
+  } else {
+    prevTime = ts;
+  }
+}
+
+// ============================== UI Update ==============================
+function updateUI(data) {
+  updateTopBar(data);
+  updateSafety(data.status);
+  updateTOF(data.tof);
+  updateIMU(data.status, data.imu);
+  updateMotors(data.foc_motors);
+  updateTriwheels(data.triwheels, data.chassis_pitch_from_triwheel);
+  document.getElementById('total-frames').textContent = data.total_frames || 0;
+}
+
+// ---- top bar ----
+function updateTopBar(data) {
+  const dot = document.getElementById('conn-dot');
+  dot.className = 'dot ' + (data.mcu_connected ? 'on' : 'off');
+  document.getElementById('mode-text').textContent = MODE_NAMES[data.status.chassis_mode] || '--';
+}
+
+// ---- safety ----
+function updateSafety(st) {
+  const mode = st.chassis_mode;
+  const el = document.getElementById('s-mode');
+  el.textContent = MODE_NAMES[mode] || '未知';
+  el.className = 'value ' + (MODE_CLASSES[mode] || '');
+
+  document.getElementById('s-conn').textContent = '已连接';
+  document.getElementById('s-conn').className = 'value';
+
+  const tmin = document.getElementById('s-tof-min');
+  tmin.textContent = st.tof_min_distance_mm > 0 ? st.tof_min_distance_mm + ' mm' : 'N/A';
+  tmin.className = 'value' + (st.tof_min_distance_mm < 200 ? ' danger' : '');
+
+  const tv = document.getElementById('s-tof-valid');
+  tv.textContent = st.tof_valid_count + '/4';
+  tv.className = 'value' + (st.tof_valid_count < 2 ? (st.tof_valid_count < 1 ? ' danger' : ' warn') : '');
+
+  // error flags
+  const flagsEl = document.getElementById('error-flags');
+  let html = '';
+  for (let i = 0; i < 9; i++) {
+    const active = (st.error_flags >> i) & 1;
+    html += `<span class="error-flag${active ? ' active' : ''}">${ERROR_NAMES[i]}</span>`;
+  }
+  flagsEl.innerHTML = html;
+}
+
+// ---- TOF bars ----
+function buildTOFBars() {
+  const container = document.getElementById('tof-bars');
+  let html = '';
+  for (let i = 0; i < 4; i++) {
+    html += `
+      <div class="tof-bar-wrap">
+        <div class="tof-val" id="tof-d${i}">0</div>
+        <div class="tof-bar valid" id="tof-b${i}" style="height:4px;"></div>
+        <div class="tof-label">S${i} <span id="tof-s${i}">--</span></div>
+      </div>`;
+  }
+  container.innerHTML = html;
+}
+
+function updateTOF(tof) {
+  if (!tof) return;
+  const maxDist = 1200;
+  for (let i = 0; i < 4; i++) {
+    const d = tof[i] || {};
+    const pct = Math.max(0.04, Math.min(1, d.distance_mm / maxDist));
+    const bar = document.getElementById('tof-b' + i);
+    const val = document.getElementById('tof-d' + i);
+    const sig = document.getElementById('tof-s' + i);
+    if (bar) {
+      bar.style.height = (pct * 140) + 'px';
+      bar.className = 'tof-bar ' + (TOF_STATUS_CLASSES[d.status] || 'invalid');
+    }
+    if (val) val.textContent = d.distance_mm || 0;
+    if (sig) sig.textContent = '信号:' + (d.signal || 0);
+  }
+}
+
+// ---- IMU / Horizon ----
+function drawHorizon(pitchDeg, rollDeg) {
+  const canvas = document.getElementById('horizon');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const cx = w/2, cy = h/2, r = 55;
+  ctx.clearRect(0, 0, w, h);
+
+  // 天空/地面
+  const pitch = Math.max(-45, Math.min(45, pitchDeg));
+  const offset = (pitch / 45) * r;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI*2);
+  ctx.clip();
+
+  // 地面 (棕色)
+  ctx.fillStyle = '#4a3728';
+  ctx.fillRect(0, cy + offset, w, h);
+  // 天空 (深蓝)
+  ctx.fillStyle = '#1a3a5c';
+  ctx.fillRect(0, 0, w, cy + offset);
+  // 地平线
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, cy + offset);
+  ctx.lineTo(w, cy + offset);
+  ctx.stroke();
+
+  ctx.restore();
+
+  // 外圈
+  ctx.strokeStyle = '#2a2d37';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI*2);
+  ctx.stroke();
+
+  // 十字线（roll 旋转）
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(-rollDeg * Math.PI / 180);
+  ctx.strokeStyle = '#c8ccd4';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-r+8, 0); ctx.lineTo(r-8, 0);
+  ctx.moveTo(0, -r+8); ctx.lineTo(0, r-8);
+  ctx.stroke();
+  // 中心点
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(0, 0, 3, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function updateIMU(status, imu) {
+  document.getElementById('imu-pitch').textContent = status.imu_pitch_deg.toFixed(1) + '°';
+  document.getElementById('imu-roll').textContent = status.imu_roll_deg.toFixed(1) + '°';
+  document.getElementById('imu-chassis').textContent = status.chassis_pitch_deg.toFixed(1) + '°';
+  document.getElementById('imu-temp').textContent = (imu.temperature_c || 0).toFixed(1) + '°C';
+  document.getElementById('imu-tof-max').textContent = (status.tof_max_distance_mm || 0) + ' mm';
+
+  drawHorizon(status.imu_pitch_deg || 0, status.imu_roll_deg || 0);
+}
+
+// ---- Motors ----
+let motorsBuilt = false;
+function buildMotors() {
+  const grid = document.getElementById('motors-grid');
+  let html = '';
+  for (let i = 0; i < 6; i++) {
+    html += `
+      <div class="motor-card" id="mc-${i}">
+        <div class="motor-name">M${i}</div>
+        <div class="motor-rpm" id="mrpm-${i}">0</div>
+        <div class="motor-bar-wrap"><div class="motor-bar" id="mbar-${i}" style="width:0;"></div></div>
+        <div class="motor-info">扭矩 <span id="mtq-${i}">0</span> | Hz <span id="mhz-${i}">0</span></div>
+      </div>`;
+  }
+  grid.innerHTML = html;
+  motorsBuilt = true;
+}
+
+function updateMotors(motors) {
+  if (!motorsBuilt) buildMotors();
+  for (let i = 0; i < 6; i++) {
+    const m = motors[i] || {};
+    document.getElementById('mrpm-' + i).textContent = m.velocity_rpm ? m.velocity_rpm.toFixed(0) + ' rpm' : '0 rpm';
+    document.getElementById('mbar-' + i).style.width = Math.min(100, Math.abs(m.velocity_rpm || 0) / 1500 * 100) + '%';
+    document.getElementById('mtq-' + i).textContent = (m.torque || 0).toFixed(3);
+    document.getElementById('mhz-' + i).textContent = m.feedback_hz || 0;
+    const card = document.getElementById('mc-' + i);
+    card.className = 'motor-card' + (m.online ? '' : ' offline');
+  }
+}
+
+// ---- Triwheels ----
+let wheelsBuilt = false;
+const WHEEL_NAMES = ['前左', '前右', '后左', '后右'];
+function buildTriwheels() {
+  const grid = document.getElementById('wheels-grid');
+  let html = '';
+  for (let i = 0; i < 4; i++) {
+    html += `
+      <div class="wheel-item">
+        <span class="wheel-name">${WHEEL_NAMES[i]}</span>
+        <div class="wheel-angles">
+          <div class="wheel-angle" id="wa-${i}">0.0°</div>
+          <div class="wheel-filtered">滤波: <span id="wf-${i}">0.0°</span></div>
+        </div>
+      </div>`;
+  }
+  grid.innerHTML = html;
+  wheelsBuilt = true;
+}
+
+function updateTriwheels(wheels, chassisPitch) {
+  if (!wheelsBuilt) buildTriwheels();
+  for (let i = 0; i < 4; i++) {
+    const w = wheels[i] || {};
+    document.getElementById('wa-' + i).textContent = (w.angle_deg || 0).toFixed(1) + '°';
+    document.getElementById('wf-' + i).textContent = (w.filtered_angle_deg || 0).toFixed(1) + '°';
+  }
+  document.getElementById('tw-pitch').textContent = (chassisPitch || 0).toFixed(1) + '°';
+}
+
+// ---- Events ----
+function addEvent(evt) {
+  const log = document.getElementById('event-log');
+  if (eventCount === 0) log.innerHTML = '';
+  eventCount++;
+
+  const now = new Date();
+  const time = now.toLocaleTimeString('zh-CN', { hour12: false });
+  let tag = '', tagClass = '', desc = '';
+
+  switch (evt.event_type) {
+    case 1: tag = '模式切换'; tagClass = 'mode';
+            desc = '→ ' + (MODE_NAMES[evt.event_code] || '未知'); break;
+    case 2: tag = '故障'; tagClass = 'error';
+            desc = ERROR_NAMES[evt.event_code] || '未知故障'; break;
+    case 3: tag = '故障恢复'; tagClass = 'mode';
+            desc = ERROR_NAMES[evt.event_code] || ''; break;
+    case 5: tag = '急停'; tagClass = 'error';
+            desc = evt.event_code === 1 ? '触发' : '解除'; break;
+    case 6: tag = 'TOF异常'; tagClass = 'error';
+            desc = ['全部无效','恢复','骤降'][evt.event_code] || ''; break;
+    default: tag = '事件'; desc = evt.event_type + '/' + evt.event_code;
+  }
+
+  const item = document.createElement('div');
+  item.className = 'event-item';
+  item.innerHTML = `<span class="event-time">${time}</span><span class="event-tag ${tagClass}">${tag}</span><span class="event-desc">${desc}</span>`;
+  log.insertBefore(item, log.firstChild);
+
+  if (eventCount > 100) log.removeChild(log.lastChild);
+}
+
+// ============================== Init ==============================
+buildTOFBars();
+connect();
+</script>
+</body>
+</html>
