@@ -12,6 +12,11 @@ import asyncio
 import json
 import os
 import time
+import threading
+import math
+from typing import List
+
+from viz_dashboard.protocol import RegAddr
 
 # ============================================================
 # 全局状态（串口读线程写入，asyncio 协程读取）
@@ -20,7 +25,6 @@ import time
 mcu_state = {
     "status": {
         "chassis_mode": 0,
-        "heartbeat_echo": 0,
         "error_flags": 0,
         "tof_min_distance_mm": 0,
         "tof_max_distance_mm": 0,
@@ -51,125 +55,192 @@ mcu_state = {
     "mcu_connected": False,
     "crc_errors": 0,
     "total_frames": 0,
+    "total_responses": 0,
 }
 
 event_queue = []   # (timestamp, event_dict)
 
-import threading
 _state_lock = threading.Lock()
 
 
-def _update_state(frame):
-    """串口读线程回调：将解析后的帧写入全局状态。"""
-    pid = frame.packet_id
-    payload = frame.payload
+# ============================================================
+# 寄存器数据 → mcu_state 更新
+# ============================================================
+
+# 电机映射: Excel 中 L3/L4/L5/R0/R1/R2 → 前端 motors[0..5]
+_MOTOR_ORDER = ["L3", "L4", "L5", "R0", "R1", "R2"]
+
+# 三角轮映射: Excel 中 lf/rf/lr/rr → 前端 triwheels[0..3]
+_TRIWHEEL_ORDER = ["lf", "rf", "lr", "rr"]
+
+# 电机扭矩/速度寄存器地址 (torque+speed pairs)
+_MOTOR_TORQUE_SPEED_ADDRS = [29, 31, 33, 35, 37, 39]  # L3, L4, L5, R0, R1, R2
+_MOTOR_ANGLE_ADDRS = [30, 32, 34, 36, 38, 40]
+
+# 三角轮角度/占空比寄存器
+_TRIWHEEL_ANGLE_FRONT_ADDR = 41
+_TRIWHEEL_ANGLE_REAR_ADDR = 42
+_TRIWHEEL_DUTY_FRONT_ADDR = 43
+_TRIWHEEL_DUTY_REAR_ADDR = 44
+
+_prev_chassis_mode = 0
+_prev_tof_faults = [0, 0, 0, 0]
+
+
+def _update_state(reg_addr: int, results: List[dict]):
+    """串口读线程回调：将解析后的寄存器数据写入全局状态。"""
+    global _prev_chassis_mode, _prev_tof_faults
+
     with _state_lock:
-        if pid == 0x01 and "chassis_mode" in payload:
-            mcu_state["status"].update(payload)
-        elif pid == 0x02 and "tof" in payload:
-            for i, s in enumerate(payload["tof"]):
-                if i < 4:
-                    mcu_state["tof"][i].update(s)
-        elif pid == 0x03:
-            mcu_state["imu"].update(payload)
-        elif pid == 0x04 and "foc_motors" in payload:
-            for i, m in enumerate(payload["foc_motors"]):
-                if i < 6:
-                    mcu_state["foc_motors"][i].update(m)
-        elif pid == 0x05:
-            if "triwheels" in payload:
-                for i, w in enumerate(payload["triwheels"]):
-                    if i < 4:
-                        mcu_state["triwheels"][i].update(w)
-            if "chassis_pitch_deg" in payload:
-                mcu_state["chassis_pitch_from_triwheel"] = payload["chassis_pitch_deg"]
-        elif pid == 0x06 and "drv_motors" in payload:
-            for i, m in enumerate(payload["drv_motors"]):
-                if i < 6:
-                    mcu_state["drv_motors"][i].update(m)
-        elif pid == 0x09:
-            event_queue.append((time.time(), payload))
+        mcu_state["total_responses"] += 1
+        for reg in results:
+            addr = reg.get("addr", reg_addr)
+
+            # ---- CTRL 寄存器 ----
+            if addr == RegAddr.CTRL:
+                mode = reg.get("chassis_mode", 0)
+                if mode != _prev_chassis_mode and _prev_chassis_mode is not None:
+                    event_queue.append((time.time(), {
+                        "event_type": 1,  # 模式切换
+                        "event_code": mode,
+                        "event_data": _prev_chassis_mode,
+                    }))
+                _prev_chassis_mode = mode
+                mcu_state["status"]["chassis_mode"] = mode
+
+                # 构建错误标志（从控制位推断）
+                error_flags = 0
+                if not reg.get("foc_enable", 0):
+                    error_flags |= (1 << 2)  # FOC故障
+                mcu_state["status"]["error_flags"] = error_flags
+
+            # ---- TOF 寄存器 ----
+            elif RegAddr.TOF1 <= addr <= RegAddr.TOF4:
+                idx = addr - RegAddr.TOF1
+                if idx < 4:
+                    dist = reg.get("distance_mm", 0)
+                    status = reg.get("status", 0)
+                    signal = reg.get("signal", 0)
+                    fault = reg.get("fault", 0)
+                    mcu_state["tof"][idx].update({
+                        "distance_mm": dist,
+                        "status": status,
+                        "signal": signal,
+                    })
+                    # TOF 故障事件
+                    if fault != _prev_tof_faults[idx]:
+                        if fault:
+                            event_queue.append((time.time(), {
+                                "event_type": 6,
+                                "event_code": idx,
+                                "event_data": fault,
+                            }))
+                    _prev_tof_faults[idx] = fault
+
+                # 更新 TOF 聚合统计
+                tofs = mcu_state["tof"]
+                valid = [t for t in tofs if t["status"] == 1 and t["distance_mm"] > 0]
+                mcu_state["status"]["tof_valid_count"] = len(valid)
+                mcu_state["status"]["tof_min_distance_mm"] = min((t["distance_mm"] for t in valid), default=0)
+                mcu_state["status"]["tof_max_distance_mm"] = max((t["distance_mm"] for t in valid), default=0)
+
+            # ---- IMU euler ----
+            elif addr == RegAddr.IMU_PITCH:
+                mcu_state["status"]["imu_pitch_deg"] = reg.get("pitch_deg", 0.0)
+            elif addr == RegAddr.IMU_ROLL:
+                mcu_state["status"]["imu_roll_deg"] = reg.get("roll_deg", 0.0)
+
+            # ---- IMU full data ----
+            elif addr == RegAddr.IMU_QUAT_W:
+                mcu_state["imu"]["quat_w"] = reg.get("quat_w", 0.0)
+            elif addr == RegAddr.IMU_QUAT_X:
+                mcu_state["imu"]["quat_x"] = reg.get("quat_x", 0.0)
+            elif addr == RegAddr.IMU_QUAT_Y:
+                mcu_state["imu"]["quat_y"] = reg.get("quat_y", 0.0)
+            elif addr == RegAddr.IMU_QUAT_Z:
+                mcu_state["imu"]["quat_z"] = reg.get("quat_z", 0.0)
+            elif addr == RegAddr.IMU_GYRO_YAW:
+                mcu_state["imu"]["gyro_z_dps"] = reg.get("gyro_yaw_dps", 0.0)
+            elif addr == RegAddr.IMU_GYRO_PITCH:
+                mcu_state["imu"]["gyro_y_dps"] = reg.get("gyro_pitch_dps", 0.0)
+            elif addr == RegAddr.IMU_GYRO_ROLL:
+                mcu_state["imu"]["gyro_x_dps"] = reg.get("gyro_roll_dps", 0.0)
+            elif addr == RegAddr.IMU_ACCEL_X:
+                mcu_state["imu"]["accel_x_g"] = reg.get("accel_x_g", 0.0)
+            elif addr == RegAddr.IMU_ACCEL_Y:
+                mcu_state["imu"]["accel_y_g"] = reg.get("accel_y_g", 0.0)
+            elif addr == RegAddr.IMU_ACCEL_Z:
+                mcu_state["imu"]["accel_z_g"] = reg.get("accel_z_g", 0.0)
+            elif addr == RegAddr.IMU_TEMP:
+                mcu_state["imu"]["temperature_c"] = reg.get("temperature_c", 0.0)
+
+            # ---- 驱动电机 ----
+            elif addr in _MOTOR_TORQUE_SPEED_ADDRS:
+                idx = _MOTOR_TORQUE_SPEED_ADDRS.index(addr)
+                if idx < 6:
+                    speed_raw = reg.get("speed", 0)
+                    torque_raw = reg.get("torque", 0)
+                    # speed: rad/s × 16 (int16) → rpm
+                    speed_rads = speed_raw / 16.0
+                    speed_rpm = speed_rads * 60.0 / (2.0 * math.pi)
+                    mcu_state["foc_motors"][idx].update({
+                        "velocity_rpm": round(speed_rpm, 1),
+                        "torque": round(torque_raw / 1000.0, 3),
+                        "feedback_hz": 0,
+                    })
+            elif addr in _MOTOR_ANGLE_ADDRS:
+                idx = _MOTOR_ANGLE_ADDRS.index(addr)
+                # total angle is available but not displayed in current UI
+                pass
+
+            # ---- 三角轮 ----
+            elif addr == _TRIWHEEL_ANGLE_FRONT_ADDR:
+                lf_raw = reg.get("tri_lf_angle", 0)
+                rf_raw = reg.get("tri_rf_angle", 0)
+                # angle: int16 × 100 → degrees
+                mcu_state["triwheels"][0].update({
+                    "angle_deg": round(lf_raw / 100.0, 1),
+                    "filtered_angle_deg": round(lf_raw / 100.0, 1),
+                })
+                mcu_state["triwheels"][1].update({
+                    "angle_deg": round(rf_raw / 100.0, 1),
+                    "filtered_angle_deg": round(rf_raw / 100.0, 1),
+                })
+            elif addr == _TRIWHEEL_ANGLE_REAR_ADDR:
+                lr_raw = reg.get("tri_lr_angle", 0)
+                rr_raw = reg.get("tri_rr_angle", 0)
+                mcu_state["triwheels"][2].update({
+                    "angle_deg": round(lr_raw / 100.0, 1),
+                    "filtered_angle_deg": round(lr_raw / 100.0, 1),
+                })
+                mcu_state["triwheels"][3].update({
+                    "angle_deg": round(rr_raw / 100.0, 1),
+                    "filtered_angle_deg": round(rr_raw / 100.0, 1),
+                })
+
+            # ---- 在线状态 ----
+            elif addr == RegAddr.ONLINE_STATUS:
+                online_bits = [
+                    reg.get("motor_id3_online", 0),  # L3
+                    reg.get("motor_id4_online", 0),  # L4
+                    reg.get("motor_id5_online", 0),  # L5
+                    reg.get("motor_id0_online", 0),  # R0
+                    reg.get("motor_id1_online", 0),  # R1
+                    reg.get("motor_id2_online", 0),  # R2
+                ]
+                for i, bit in enumerate(online_bits):
+                    mcu_state["foc_motors"][i]["online"] = 1 if bit else 0
+
+            # ---- IMU euler 补充 (pitch for chassis) ----
+            if addr == RegAddr.IMU_PITCH:
+                pitch = reg.get("pitch_deg", 0.0)
+                mcu_state["status"]["chassis_pitch_deg"] = pitch * 0.9
+                mcu_state["chassis_pitch_from_triwheel"] = pitch * 0.85
 
 
 def _update_connection(connected: bool):
     with _state_lock:
         mcu_state["mcu_connected"] = connected
-
-
-# ============================================================
-# 模拟数据源（无硬件时）
-# ============================================================
-
-def _start_mock():
-    """在后台线程运行模拟串口数据源，直接更新 mcu_state。"""
-    import threading
-    import time
-    import math
-    import random
-
-    def _run():
-        tick = 0
-        while True:
-            with _state_lock:
-                s = mcu_state["status"]
-                t = tick * 0.001
-                s["chassis_mode"] = 2
-                s["error_flags"] = 0
-                s["tof_valid_count"] = 4
-                s["tof_min_distance_mm"] = 220 + int(random.gauss(0, 10))
-                s["tof_max_distance_mm"] = 920 + int(random.gauss(0, 15))
-                s["imu_pitch_deg"] = round(math.sin(t * 2.0) * 3.0, 1)
-                s["imu_roll_deg"] = round(math.cos(t * 1.7) * 1.5, 1)
-                s["chassis_pitch_deg"] = round(s["imu_pitch_deg"] * 0.9, 1)
-
-                for i in range(4):
-                    tof = mcu_state["tof"][i]
-                    base = [850, 820, 910, 230][i]
-                    tof["distance_mm"] = max(0, int(base + random.gauss(0, 15)))
-                    tof["status"] = 1 if tof["distance_mm"] > 50 else 0
-                    tof["signal"] = max(0, min(255, int([200, 180, 210, 90][i] + random.gauss(0, 5))))
-
-                imu = mcu_state["imu"]
-                pitch_r = math.radians(s["imu_pitch_deg"])
-                roll_r = math.radians(s["imu_roll_deg"])
-                imu["quat_w"] = math.cos(pitch_r/2) * math.cos(roll_r/2)
-                imu["quat_x"] = math.sin(roll_r/2) * math.cos(pitch_r/2)
-                imu["quat_y"] = math.sin(pitch_r/2) * math.cos(roll_r/2)
-                imu["quat_z"] = math.sin(pitch_r/2) * math.sin(roll_r/2)
-                imu["gyro_x_dps"] = random.gauss(0, 0.05)
-                imu["gyro_y_dps"] = random.gauss(0, 0.05)
-                imu["gyro_z_dps"] = random.gauss(0, 0.05)
-                imu["accel_z_g"] = 0.98 + random.gauss(0, 0.02)
-                imu["temperature_c"] = 35.0 + random.gauss(0, 0.3)
-
-                for m in mcu_state["foc_motors"]:
-                    m["online"] = 1
-                    m["velocity_rpm"] = round(1200 + random.gauss(0, 30), 1)
-                    m["torque"] = round(random.gauss(0, 0.1), 3)
-                    m["feedback_hz"] = 900 + int(random.gauss(0, 20))
-
-                for i, w in enumerate(mcu_state["triwheels"]):
-                    base = 45.0 if i in (0, 2) else -45.0
-                    w["angle_deg"] = round(base + random.gauss(0, 0.5), 1)
-                    w["filtered_angle_deg"] = round(w["angle_deg"] + random.gauss(0, 0.1), 1)
-
-                mcu_state["chassis_pitch_from_triwheel"] = round(s["imu_pitch_deg"] * 0.85, 1)
-
-                for i, d in enumerate(mcu_state["drv_motors"]):
-                    d["enabled"] = 1 if i < 4 else 0
-                    d["duty"] = round(random.uniform(0.3, 0.7), 3)
-                    d["current_ma"] = int(random.gauss(500, 100))
-
-                mcu_state["mcu_connected"] = True
-                mcu_state["total_frames"] += 1
-
-            tick += 1
-            if tick >= 100:
-                tick = 0
-            time.sleep(0.01)   # ~100Hz
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
 
 
 # ============================================================
@@ -227,11 +298,10 @@ async def _push_loop():
                     "drv_motors": [dict(d) for d in mcu_state["drv_motors"]],
                     "mcu_connected": mcu_state["mcu_connected"],
                     "crc_errors": mcu_state["crc_errors"],
-                    "total_frames": mcu_state["total_frames"],
+                    "total_frames": mcu_state["total_responses"],
                 },
             }, ensure_ascii=False)
 
-        # 处理事件队列
         events_snapshot = []
         while event_queue:
             ts, evt = event_queue.pop(0)
@@ -262,7 +332,7 @@ async def websocket_endpoint(ws: WebSocket):
     _ws_clients.append(ws)
     try:
         while True:
-            await ws.receive_text()  # 保持连接，处理前端发来的消息
+            await ws.receive_text()
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -284,17 +354,15 @@ def main():
     parser.add_argument("--web-port", type=int, default=8080)
     args = parser.parse_args()
 
+    from viz_dashboard.serial_driver import SerialDriver
+    driver = SerialDriver(port=args.port, baud_rate=args.baud)
+    driver.on_registers = _update_state
+    driver.on_connected_changed = _update_connection
+    driver.start()
+
     if args.port:
-        # 真实串口模式
-        from viz_dashboard.serial_driver import SerialDriver
-        driver = SerialDriver(port=args.port, baud_rate=args.baud)
-        driver.on_frame = _update_state
-        driver.on_connected_changed = _update_connection
-        driver.start()
         print(f"[串口模式] 已连接 {args.port} @ {args.baud}")
     else:
-        # 模拟数据模式
-        _start_mock()
         print("[模拟模式] 使用内置模拟数据源，打开 http://localhost:8080")
 
     import uvicorn

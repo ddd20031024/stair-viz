@@ -1,13 +1,12 @@
-"""通信协议层：帧编解码、CRC16、数据包定义。
+"""通信协议层：FlexWire 寄存器读写 + CRC16。
 
-与 mcu_bridge 100% 复用，基于通信协议设计 v1.0。
+基于 TI FlexWire 协议改进，取消设备地址段，增加读取长度。
+寄存器地址 + 内容形式，每个寄存器 32-bit。
 """
 
 import struct
-from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional
-
+from typing import Optional, List, Tuple
 
 # ============================================================
 # CRC16
@@ -28,364 +27,384 @@ def crc16_ccitt(data: bytes) -> int:
 
 
 # ============================================================
-# 帧常量
+# 协议常量
 # ============================================================
 
-SOF1 = 0x5A
-SOF2 = 0xA5
+SYNC = 0x55          # UART 同步字节
+SOF_HOST = 0x5A      # 主机→MCU 帧起始
+SOF_MCU = 0xA5       # MCU→主机 帧起始
 
-DIR_UPLOAD = 0x00   # MCU → 上位机
-DIR_COMMAND = 0x80  # 上位机 → MCU
+# ============================================================
+# 寄存器地址定义
+# ============================================================
+
+class RegAddr(IntEnum):
+    """寄存器地址枚举。
+
+    Excel 中使用 "0x" 前缀 + 十进制数字的记法，如 0x10=10, 0x20=20。
+    所有地址均为十进制整数值。
+    """
+    # ---- 控制寄存器 (r/w) ----
+    CTRL = 0                # 0x00
+    DRIVE_SPEED = 1         # 0x01
+    DRIVE_ACCEL = 2         # 0x02
+    LEFT_DRIVE_PID = 3      # 0x03
+    RIGHT_DRIVE_PID = 4     # 0x04
+    DRIVE_FF_TORQUE = 5     # 0x05
+    OPENLOOP_TORQUE = 6     # 0x06
+    TRIWHEEL_ANGLE_FRONT = 7   # 0x07
+    TRIWHEEL_ANGLE_REAR = 8    # 0x08
+    TRIWHEEL_DUTY_FRONT = 9    # 0x09
+    TRIWHEEL_DUTY_REAR = 10    # 0x10
+
+    # ---- TOF 传感器 (r) ----
+    TOF1 = 11               # 0x11
+    TOF2 = 12               # 0x12
+    TOF3 = 13               # 0x13
+    TOF4 = 14               # 0x14
+
+    # ---- IMU (r) ----
+    IMU_QUAT_W = 15         # 0x15
+    IMU_QUAT_X = 16         # 0x16
+    IMU_QUAT_Y = 17         # 0x17
+    IMU_QUAT_Z = 18         # 0x18
+    IMU_YAW = 19            # 0x19
+    IMU_PITCH = 20          # 0x20
+    IMU_ROLL = 21           # 0x21
+    IMU_GYRO_YAW = 22       # 0x22
+    IMU_GYRO_PITCH = 23     # 0x23
+    IMU_GYRO_ROLL = 24      # 0x24
+    IMU_ACCEL_X = 25        # 0x25
+    IMU_ACCEL_Y = 26        # 0x26
+    IMU_ACCEL_Z = 27        # 0x27
+    IMU_TEMP = 28           # 0x28
+
+    # ---- 驱动电机反馈 (r) ----
+    MOTOR_L3_TORQUE_SPEED = 29  # 0x29
+    MOTOR_L3_ANGLE = 30         # 0x30
+    MOTOR_L4_TORQUE_SPEED = 31  # 0x31
+    MOTOR_L4_ANGLE = 32         # 0x32
+    MOTOR_L5_TORQUE_SPEED = 33  # 0x33
+    MOTOR_L5_ANGLE = 34         # 0x34
+    MOTOR_R0_TORQUE_SPEED = 35  # 0x35
+    MOTOR_R0_ANGLE = 36         # 0x36
+    MOTOR_R1_TORQUE_SPEED = 37  # 0x37
+    MOTOR_R1_ANGLE = 38         # 0x38
+    MOTOR_R2_TORQUE_SPEED = 39  # 0x39
+    MOTOR_R2_ANGLE = 40         # 0x40
+
+    # ---- 三角轮反馈 (r) ----
+    TRIWHEEL_ANGLE_CUR_FRONT = 41   # 0x41
+    TRIWHEEL_ANGLE_CUR_REAR = 42    # 0x42
+    TRIWHEEL_DUTY_CUR_FRONT = 43    # 0x43
+    TRIWHEEL_DUTY_CUR_REAR = 44     # 0x44
+
+    # ---- 角加速度计 (r) ----
+    ACCEL_LF_X = 45         # 0x45
+    ACCEL_LF_Y = 46         # 0x46
+    ACCEL_LF_Z = 47         # 0x47
+    ACCEL_RF_X = 48         # 0x48
+    ACCEL_RF_Y = 49         # 0x49
+    ACCEL_RF_Z = 50         # 0x50
+    ACCEL_LR_X = 51         # 0x51
+    ACCEL_LR_Y = 52         # 0x52
+    ACCEL_LR_Z = 53         # 0x53
+    ACCEL_RR_X = 54         # 0x54
+    ACCEL_RR_Y = 55         # 0x55
+    ACCEL_RR_Z = 56         # 0x56
+
+    # ---- 在线状态 (r) ----
+    ONLINE_STATUS = 57      # 0x57
 
 
-class PacketID(IntEnum):
-    """上传数据包 ID (0x00~0x0F)。"""
-    FAST_STATUS = 0x01
-    TOFSENSE_FULL = 0x02
-    IMU_ATTITUDE = 0x03
-    FOC_FEEDBACK = 0x04
-    TRIWHEEL_FEEDBACK = 0x05
-    DRV8701_FEEDBACK = 0x06
-    CHASSIS_FULL = 0x07
-    FOC_CONFIG = 0x08
-    EVENT_NOTIFY = 0x09
-    ACK = 0x0A
+# ============================================================
+# 寄存器字段定义
+# ============================================================
+
+def _hf16(hi: int, lo: int) -> Tuple[int, int, int]:
+    """半寄存器有符号 16-bit 字段: (bit_offset, bit_len, signed)"""
+    return (lo, hi - lo + 1, 1)
+
+def _hfu16(hi: int, lo: int) -> Tuple[int, int, int]:
+    """半寄存器无符号 16-bit 字段"""
+    return (lo, hi - lo + 1, 0)
+
+def _f32() -> Tuple[int, int, str]:
+    """全寄存器 float32"""
+    return (0, 32, 'f')
+
+def _bit(pos: int) -> Tuple[int, int, int]:
+    """单个 bit 字段"""
+    return (pos, 1, 0)
+
+def _bits(hi: int, lo: int) -> Tuple[int, int, int]:
+    """多 bit 无符号字段"""
+    return (lo, hi - lo + 1, 0)
 
 
-class CmdID(IntEnum):
-    """命令数据包 ID (0x10~0x1F)。"""
-    HEARTBEAT = 0x10
-    EMERGENCY_STOP = 0x11
-    MODE_CONTROL = 0x12
-    CHASSIS_VELOCITY = 0x13
-    CHASSIS_TORQUE = 0x14
-    TRIWHEEL_ANGLE = 0x15
-    FOC_DIRECT = 0x16
-    FOC_GAINS = 0x17
-    DRV8701_DIRECT = 0x18
-    POLL_REQUEST = 0x19
-    CALIBRATION = 0x1A
+REGISTER_DEFS = {
+    # ---- 控制寄存器 ----
+    RegAddr.CTRL: {
+        "chassis_mode": _bits(31, 29),
+        "foc_enable": _bit(28),
+        "brushed_enable": _bit(27),
+        "foc_ctrl_mode": _bit(26),
+        "brushed_ctrl_mode": _bit(25),
+        "tri_lf_zero": _bit(24),
+        "tri_rf_zero": _bit(23),
+        "tri_lr_zero": _bit(22),
+        "tri_rr_zero": _bit(21),
+        "drive_id0_clear": _bit(20),
+        "drive_id1_clear": _bit(19),
+        "drive_id2_clear": _bit(18),
+        "drive_id3_clear": _bit(17),
+        "drive_id4_clear": _bit(16),
+        "drive_id5_clear": _bit(15),
+    },
 
+    # ---- 驱动轮速度/加速度 (半寄存器对) ----
+    RegAddr.DRIVE_SPEED: {
+        "left_speed": _hf16(31, 16),
+        "right_speed": _hf16(15, 0),
+    },
+    RegAddr.DRIVE_ACCEL: {
+        "left_accel": _hf16(31, 16),
+        "right_accel": _hf16(15, 0),
+    },
+    RegAddr.LEFT_DRIVE_PID: {
+        "left_kp": _hf16(31, 16),
+        "left_kd": _hf16(15, 0),
+    },
+    RegAddr.RIGHT_DRIVE_PID: {
+        "right_kp": _hf16(31, 16),
+        "right_kd": _hf16(15, 0),
+    },
+    RegAddr.DRIVE_FF_TORQUE: {
+        "left_ff_torque": _hf16(31, 16),
+        "right_ff_torque": _hf16(15, 0),
+    },
+    RegAddr.OPENLOOP_TORQUE: {
+        "left_ol_torque": _hf16(31, 16),
+        "right_ol_torque": _hf16(15, 0),
+    },
+    RegAddr.TRIWHEEL_ANGLE_FRONT: {
+        "tri_lf_angle_target": _hf16(31, 16),
+        "tri_rf_angle_target": _hf16(15, 0),
+    },
+    RegAddr.TRIWHEEL_ANGLE_REAR: {
+        "tri_lr_angle_target": _hf16(31, 16),
+        "tri_rr_angle_target": _hf16(15, 0),
+    },
+    RegAddr.TRIWHEEL_DUTY_FRONT: {
+        "tri_lf_duty_target": _hf16(31, 16),
+        "tri_rf_duty_target": _hf16(15, 0),
+    },
+    RegAddr.TRIWHEEL_DUTY_REAR: {
+        "tri_lr_duty_target": _hf16(31, 16),
+        "tri_rr_duty_target": _hf16(15, 0),
+    },
 
-class ChassisMode(IntEnum):
-    SAFE = 0
-    OPEN_LOOP = 1
-    CLOSED_LOOP = 2
-    SLAVE = 3
+    # ---- TOF ----
+    RegAddr.TOF1: {
+        "distance_mm": _hfu16(31, 16),
+        "signal": _bits(15, 8),
+        "status": _bits(7, 5),
+        "fault": _bit(4),
+    },
+    RegAddr.TOF2: {
+        "distance_mm": _hfu16(31, 16),
+        "signal": _bits(15, 8),
+        "status": _bits(7, 5),
+        "fault": _bit(4),
+    },
+    RegAddr.TOF3: {
+        "distance_mm": _hfu16(31, 16),
+        "signal": _bits(15, 8),
+        "status": _bits(7, 5),
+        "fault": _bit(4),
+    },
+    RegAddr.TOF4: {
+        "distance_mm": _hfu16(31, 16),
+        "signal": _bits(15, 8),
+        "status": _bits(7, 5),
+        "fault": _bit(4),
+    },
 
+    # ---- IMU float32 ----
+    RegAddr.IMU_QUAT_W: {"quat_w": _f32()},
+    RegAddr.IMU_QUAT_X: {"quat_x": _f32()},
+    RegAddr.IMU_QUAT_Y: {"quat_y": _f32()},
+    RegAddr.IMU_QUAT_Z: {"quat_z": _f32()},
+    RegAddr.IMU_YAW: {"yaw_deg": _f32()},
+    RegAddr.IMU_PITCH: {"pitch_deg": _f32()},
+    RegAddr.IMU_ROLL: {"roll_deg": _f32()},
+    RegAddr.IMU_GYRO_YAW: {"gyro_yaw_dps": _f32()},
+    RegAddr.IMU_GYRO_PITCH: {"gyro_pitch_dps": _f32()},
+    RegAddr.IMU_GYRO_ROLL: {"gyro_roll_dps": _f32()},
+    RegAddr.IMU_ACCEL_X: {"accel_x_g": _f32()},
+    RegAddr.IMU_ACCEL_Y: {"accel_y_g": _f32()},
+    RegAddr.IMU_ACCEL_Z: {"accel_z_g": _f32()},
+    RegAddr.IMU_TEMP: {"temperature_c": _f32()},
 
-class EventType(IntEnum):
-    MODE_CHANGE = 0x01
-    ERROR = 0x02
-    ERROR_CLEAR = 0x03
-    DBUS = 0x04
-    ESTOP = 0x05
-    TOF_ANOMALY = 0x06
+    # ---- 驱动电机反馈 ----
+    RegAddr.MOTOR_L3_TORQUE_SPEED: {"torque": _hf16(31, 16), "speed": _hf16(15, 0)},
+    RegAddr.MOTOR_L3_ANGLE: {"total_angle_rad": _f32()},
+    RegAddr.MOTOR_L4_TORQUE_SPEED: {"torque": _hf16(31, 16), "speed": _hf16(15, 0)},
+    RegAddr.MOTOR_L4_ANGLE: {"total_angle_rad": _f32()},
+    RegAddr.MOTOR_L5_TORQUE_SPEED: {"torque": _hf16(31, 16), "speed": _hf16(15, 0)},
+    RegAddr.MOTOR_L5_ANGLE: {"total_angle_rad": _f32()},
+    RegAddr.MOTOR_R0_TORQUE_SPEED: {"torque": _hf16(31, 16), "speed": _hf16(15, 0)},
+    RegAddr.MOTOR_R0_ANGLE: {"total_angle_rad": _f32()},
+    RegAddr.MOTOR_R1_TORQUE_SPEED: {"torque": _hf16(31, 16), "speed": _hf16(15, 0)},
+    RegAddr.MOTOR_R1_ANGLE: {"total_angle_rad": _f32()},
+    RegAddr.MOTOR_R2_TORQUE_SPEED: {"torque": _hf16(31, 16), "speed": _hf16(15, 0)},
+    RegAddr.MOTOR_R2_ANGLE: {"total_angle_rad": _f32()},
 
+    # ---- 三角轮反馈 ----
+    RegAddr.TRIWHEEL_ANGLE_CUR_FRONT: {
+        "tri_lf_angle": _hf16(31, 16), "tri_rf_angle": _hf16(15, 0),
+    },
+    RegAddr.TRIWHEEL_ANGLE_CUR_REAR: {
+        "tri_lr_angle": _hf16(31, 16), "tri_rr_angle": _hf16(15, 0),
+    },
+    RegAddr.TRIWHEEL_DUTY_CUR_FRONT: {
+        "tri_lf_duty": _hf16(31, 16), "tri_rf_duty": _hf16(15, 0),
+    },
+    RegAddr.TRIWHEEL_DUTY_CUR_REAR: {
+        "tri_lr_duty": _hf16(31, 16), "tri_rr_duty": _hf16(15, 0),
+    },
 
-# 错误标志位
-ERROR_FLAG_NAMES = {
-    0: "急停",
-    1: "IMU故障",
-    2: "FOC故障",
-    3: "DRV故障",
-    4: "TOF故障",
-    5: "DBUS断连",
-    6: "过温",
-    7: "电压异常",
-    8: "三角轮故障",
+    # ---- 角加速度计 ----
+    RegAddr.ACCEL_LF_X: {"accel_lf_x": _f32()},
+    RegAddr.ACCEL_LF_Y: {"accel_lf_y": _f32()},
+    RegAddr.ACCEL_LF_Z: {"accel_lf_z": _f32()},
+    RegAddr.ACCEL_RF_X: {"accel_rf_x": _f32()},
+    RegAddr.ACCEL_RF_Y: {"accel_rf_y": _f32()},
+    RegAddr.ACCEL_RF_Z: {"accel_rf_z": _f32()},
+    RegAddr.ACCEL_LR_X: {"accel_lr_x": _f32()},
+    RegAddr.ACCEL_LR_Y: {"accel_lr_y": _f32()},
+    RegAddr.ACCEL_LR_Z: {"accel_lr_z": _f32()},
+    RegAddr.ACCEL_RR_X: {"accel_rr_x": _f32()},
+    RegAddr.ACCEL_RR_Y: {"accel_rr_y": _f32()},
+    RegAddr.ACCEL_RR_Z: {"accel_rr_z": _f32()},
+
+    # ---- 在线状态 ----
+    RegAddr.ONLINE_STATUS: {
+        "motor_id0_online": _bit(0),
+        "motor_id1_online": _bit(1),
+        "motor_id2_online": _bit(2),
+        "motor_id3_online": _bit(3),
+        "motor_id4_online": _bit(4),
+        "motor_id5_online": _bit(5),
+        "accel_lf_online": _bit(6),
+        "accel_rf_online": _bit(7),
+        "accel_lr_online": _bit(8),
+        "accel_rr_online": _bit(9),
+        "tof1_online": _bit(10),
+        "tof2_online": _bit(11),
+        "tof3_online": _bit(12),
+        "tof4_online": _bit(13),
+        "dbus_online": _bit(14),
+    },
 }
 
-CHASSIS_MODE_NAMES = {0: "安全", 1: "开环", 2: "闭环", 3: "从机"}
 
-TOF_STATUS_NAMES = {0: "无效", 1: "有效", 2: "弱信号", 3: "超量程", 0xFF: "未知"}
+# ============================================================
+# 帧构建（主机 → MCU）
+# ============================================================
 
-EVENT_TYPE_NAMES = {
-    0x01: "模式切换",
-    0x02: "故障",
-    0x03: "故障恢复",
-    0x04: "DBUS",
-    0x05: "急停",
-    0x06: "TOF异常",
-}
+def build_read_request(reg_addr: int, length: int) -> bytes:
+    """构建读寄存器请求帧。
+
+    SYNC(0x55) | SOF(0x5A) | REG_ADDR(1B) | LEN(1B) | CRC16(2B)
+    """
+    header = struct.pack('<BB', reg_addr, length)
+    crc = crc16_ccitt(header)
+    return bytes([SYNC, SOF_HOST]) + header + struct.pack('<H', crc)
+
+
+def build_write_request(reg_addr: int, data: bytes) -> bytes:
+    """构建写寄存器请求帧。
+
+    SYNC(0x55) | SOF(0x5A) | REG_ADDR(1B) | LEN(1B) | DATA(4B×LEN) | CRC16(2B)
+    """
+    length = len(data) // 4
+    header = struct.pack('<BB', reg_addr, length)
+    crc_input = header + data
+    crc = crc16_ccitt(crc_input)
+    return bytes([SYNC, SOF_HOST]) + crc_input + struct.pack('<H', crc)
+
+
+def build_write_register(reg_addr: int, value: int) -> bytes:
+    """构建单个寄存器写请求（value 为 32-bit 整数值）。"""
+    return build_write_request(reg_addr, struct.pack('<I', value))
 
 
 # ============================================================
-# 解析后帧结构
+# 响应解码（MCU → 主机）
 # ============================================================
 
-@dataclass
-class ParsedFrame:
-    packet_id: int
-    seq_num: int
-    payload: dict
-    is_command: bool = False
-
-
-# ============================================================
-# 上传数据包 payload 解析
-# ============================================================
-
-def _parse_fast_status(data: bytes) -> dict:
-    if len(data) < 12:
-        return {}
-    chassis_mode = data[0]
-    heartbeat_echo = data[1]
-    error_flags = struct.unpack_from('<H', data, 2)[0]
-    tof_min = struct.unpack_from('<H', data, 4)[0]
-    tof_max = struct.unpack_from('<H', data, 6)[0]
-    tof_valid = data[8]
-    imu_pitch = data[9] / 10.0 if data[9] < 128 else (data[9] - 256) / 10.0
-    imu_roll = data[10] / 10.0 if data[10] < 128 else (data[10] - 256) / 10.0
-    chassis_pitch = data[11] / 10.0 if data[11] < 128 else (data[11] - 256) / 10.0
-    return {
-        "chassis_mode": chassis_mode,
-        "heartbeat_echo": heartbeat_echo,
-        "error_flags": error_flags,
-        "tof_min_distance_mm": tof_min,
-        "tof_max_distance_mm": tof_max,
-        "tof_valid_count": tof_valid,
-        "imu_pitch_deg": imu_pitch,
-        "imu_roll_deg": imu_roll,
-        "chassis_pitch_deg": chassis_pitch,
-    }
-
-
-def _parse_tofsense_full(data: bytes) -> dict:
-    sensors = []
-    for s in range(4):
-        offset = s * 4
-        if offset + 4 > len(data):
-            break
-        dist = struct.unpack_from('<H', data, offset)[0]
-        status = data[offset + 2]
-        signal = data[offset + 3]
-        sensors.append({
-            "distance_mm": dist,
-            "status": status,
-            "signal": signal,
-        })
-    return {"tof": sensors}
-
-
-def _parse_imu_attitude(data: bytes) -> dict:
-    if len(data) < 44:
-        return {}
-    quat_w, quat_x, quat_y, quat_z = struct.unpack_from('<ffff', data, 0)
-    gyro_x, gyro_y, gyro_z = struct.unpack_from('<fff', data, 16)
-    accel_x, accel_y, accel_z = struct.unpack_from('<fff', data, 28)
-    temp = struct.unpack_from('<f', data, 40)[0]
-    return {
-        "quat_w": quat_w, "quat_x": quat_x, "quat_y": quat_y, "quat_z": quat_z,
-        "gyro_x_dps": gyro_x, "gyro_y_dps": gyro_y, "gyro_z_dps": gyro_z,
-        "accel_x_g": accel_x, "accel_y_g": accel_y, "accel_z_g": accel_z,
-        "temperature_c": temp,
-    }
-
-
-def _parse_foc_feedback(data: bytes) -> dict:
-    motors = []
-    for m in range(6):
-        offset = m * 7
-        if offset + 7 > len(data):
-            break
-        online = data[offset]
-        vel_raw = struct.unpack_from('<h', data, offset + 1)[0]
-        torque_raw = struct.unpack_from('<h', data, offset + 3)[0]
-        fb_hz = struct.unpack_from('<H', data, offset + 5)[0]
-        motors.append({
-            "online": online,
-            "velocity_rpm": vel_raw / 10.0,
-            "torque": torque_raw / 1000.0,
-            "feedback_hz": fb_hz,
-        })
-    return {"foc_motors": motors}
-
-
-def _parse_triwheel_feedback(data: bytes) -> dict:
-    wheels = []
-    for w in range(4):
-        offset = w * 8
-        if offset + 8 > len(data):
-            break
-        angle, filtered = struct.unpack_from('<ff', data, offset)
-        wheels.append({
-            "angle_deg": angle,
-            "filtered_angle_deg": filtered,
-        })
-    chassis_pitch = 0.0
-    if len(data) >= 36:
-        chassis_pitch = struct.unpack_from('<f', data, 32)[0]
-    return {"triwheels": wheels, "chassis_pitch_deg": chassis_pitch}
-
-
-def _parse_drv8701_feedback(data: bytes) -> dict:
-    motors = []
-    for m in range(6):
-        offset = m * 7
-        if offset + 7 > len(data):
-            break
-        enabled = data[offset]
-        mode = data[offset + 1]
-        direction_raw = data[offset + 2]
-        direction = -1 if direction_raw > 127 else direction_raw
-        duty_raw = struct.unpack_from('<h', data, offset + 3)[0]
-        current_raw = struct.unpack_from('<h', data, offset + 5)[0]
-        motors.append({
-            "enabled": enabled,
-            "mode": mode,
-            "direction": direction,
-            "duty": duty_raw / 1000.0,
-            "current_ma": current_raw,
-        })
-    return {"drv_motors": motors}
-
-
-def _parse_event_notify(data: bytes) -> dict:
-    if len(data) < 6:
-        return {}
-    event_type = data[0]
-    event_code = data[1]
-    event_data = struct.unpack_from('<I', data, 2)[0]
-    return {
-        "event_type": event_type,
-        "event_code": event_code,
-        "event_data": event_data,
-    }
-
-
-def _parse_ack(data: bytes) -> dict:
-    if len(data) < 3:
-        return {}
-    return {
-        "ack_packet_id": data[0],
-        "error_code": data[1],
-    }
-
-
-# payload 解析器映射
-_PARSERS = {
-    PacketID.FAST_STATUS: _parse_fast_status,
-    PacketID.TOFSENSE_FULL: _parse_tofsense_full,
-    PacketID.IMU_ATTITUDE: _parse_imu_attitude,
-    PacketID.FOC_FEEDBACK: _parse_foc_feedback,
-    PacketID.TRIWHEEL_FEEDBACK: _parse_triwheel_feedback,
-    PacketID.DRV8701_FEEDBACK: _parse_drv8701_feedback,
-    PacketID.EVENT_NOTIFY: _parse_event_notify,
-    PacketID.ACK: _parse_ack,
-}
-
-
-# ============================================================
-# 帧解码器（状态机）
-# ============================================================
-
-class FrameDecoder:
-    """SOF 状态机帧解码器。
+class ResponseDecoder:
+    """MCU 响应帧解码器（状态机）。
 
     用法:
-        decoder = FrameDecoder()
+        decoder = ResponseDecoder(expected_data_len=8)
         for byte in serial_stream:
-            frame = decoder.feed(byte)
-            if frame:
-                handle(frame)
+            data = decoder.feed(byte)
+            if data is not None:
+                handle(data)
     """
 
     STATE_IDLE = 0
-    STATE_GOT_5A = 1
-    STATE_GOT_A5 = 2
-    STATE_READING = 3
+    STATE_READING = 1
 
     def __init__(self):
         self._state = self.STATE_IDLE
         self._buf = bytearray()
-        self._payload_len = 0
+        self._expected = 0
         self._crc_errors = 0
-        self._total_frames = 0
+        self._total_responses = 0
 
-    def feed(self, byte: int) -> Optional[ParsedFrame]:
-        """喂入单个字节，完整帧到达时返回 ParsedFrame，否则返回 None。"""
+    def set_expected(self, data_len: int):
+        """设置期望的数据字节数（不含 CRC）。"""
+        self._expected = data_len
+
+    def feed(self, byte: int) -> Optional[bytes]:
+        """喂入单个字节，完整响应到达时返回 data bytes，否则返回 None。"""
         b = byte & 0xFF
 
         if self._state == self.STATE_IDLE:
-            if b == SOF1:
-                self._state = self.STATE_GOT_5A
-            return None
-
-        if self._state == self.STATE_GOT_5A:
-            if b == SOF2:
-                self._state = self.STATE_GOT_A5
+            if b == SOF_MCU:
+                self._state = self.STATE_READING
                 self._buf = bytearray()
-            else:
-                self._state = self.STATE_IDLE
-            return None
-
-        if self._state == self.STATE_GOT_A5:
-            # b = Frame_Type
-            self._buf.append(b)
-            self._state = self.STATE_READING
-            self._header_read = 1
             return None
 
         # STATE_READING
         self._buf.append(b)
-        self._header_read = getattr(self, '_header_read', 0) + 1
+        needed = self._expected + 2  # data + CRC16
 
-        if self._header_read == 3:
-            # Payload_Len (2 bytes) just completed
-            self._payload_len = struct.unpack_from('<H', self._buf, 1)[0]
-        elif self._header_read >= 4 and len(self._buf) >= 3 + self._payload_len + 2:
-            # Got full frame: header(1B type + 2B len + 1B seq) + payload + crc(2B)
-            return self._finalize()
+        if len(self._buf) >= needed:
+            data = bytes(self._buf[:self._expected])
+            crc_received = struct.unpack_from('<H', self._buf, self._expected)[0]
+            self._total_responses += 1
+            self._state = self.STATE_IDLE
+
+            crc_expected = crc16_ccitt(data)
+            if crc_received != crc_expected:
+                self._crc_errors += 1
+                return None
+
+            return data
 
         return None
-
-    def _finalize(self) -> Optional[ParsedFrame]:
-        header_end = 4  # type(1) + len(2) + seq(1)
-        payload_end = header_end + self._payload_len
-        frame_type = self._buf[0]
-        payload_len = struct.unpack_from('<H', self._buf, 1)[0]
-        seq_num = self._buf[3]
-        payload = bytes(self._buf[header_end:payload_end])
-        crc_received = struct.unpack_from('<H', self._buf, payload_end)[0]
-
-        # Verify CRC over frame_type..payload (bytes 0..payload_end-1)
-        crc_expected = crc16_ccitt(bytes(self._buf[:payload_end]))
-        self._total_frames += 1
-
-        if crc_received != crc_expected:
-            self._crc_errors += 1
-            self._state = self.STATE_IDLE
-            return None
-
-        # Reset for next frame
-        self._state = self.STATE_IDLE
-
-        is_command = bool(frame_type & 0x80)
-        packet_id = frame_type & 0x7F
-
-        # Parse payload
-        parsed_payload = {}
-        if not is_command and packet_id in _PARSERS:
-            try:
-                parsed_payload = _PARSERS[packet_id](payload)
-            except Exception:
-                pass
-
-        return ParsedFrame(
-            packet_id=packet_id,
-            seq_num=seq_num,
-            payload=parsed_payload,
-            is_command=is_command,
-        )
 
     @property
     def crc_errors(self) -> int:
         return self._crc_errors
 
     @property
-    def total_frames(self) -> int:
-        return self._total_frames
+    def total_responses(self) -> int:
+        return self._total_responses
 
     def reset(self):
         self._state = self.STATE_IDLE
@@ -393,36 +412,80 @@ class FrameDecoder:
 
 
 # ============================================================
-# 帧编码器（上位机 → MCU）
+# 寄存器数据解析
 # ============================================================
 
-class FrameEncoder:
-    """构建命令帧字节序列。"""
+def parse_register(reg_addr: int, raw_value: int) -> dict:
+    """将 32-bit 寄存器原始值按字段定义解析为 dict。"""
+    fields = REGISTER_DEFS.get(reg_addr)
+    if fields is None:
+        return {"_raw": raw_value}
 
-    def __init__(self):
-        self._seq_num = 0
+    result = {}
+    for name, (offset, length, kind) in fields.items():
+        mask = (1 << length) - 1
+        raw_bits = (raw_value >> offset) & mask
 
-    def build_frame(self, packet_id: int, payload: bytes) -> bytes:
-        """构建完整帧（含 SOF + CRC16）。"""
-        frame_type = packet_id | DIR_COMMAND
-        seq = self._seq_num
-        self._seq_num = (self._seq_num + 1) & 0xFF
+        if kind == 'f':
+            # float32
+            result[name] = struct.unpack('<f', struct.pack('<I', raw_value))[0]
+        elif kind == 1:
+            # signed integer (int16 for half-register)
+            if raw_bits & (1 << (length - 1)):
+                raw_bits -= (1 << length)
+            result[name] = raw_bits
+        else:
+            # unsigned integer or bit
+            result[name] = raw_bits
 
-        header = bytes([frame_type])
-        header += struct.pack('<H', len(payload))
-        header += bytes([seq])
+    return result
 
-        crc_input = header + payload
-        crc = crc16_ccitt(crc_input)
 
-        frame = bytes([SOF1, SOF2]) + crc_input + struct.pack('<H', crc)
-        return frame
+def parse_response(reg_addr: int, data: bytes) -> List[dict]:
+    """解析读响应数据，返回寄存器数据列表（每个元素一个 dict）。"""
+    results = []
+    num_regs = len(data) // 4
+    for i in range(num_regs):
+        raw = struct.unpack_from('<I', data, i * 4)[0]
+        addr = reg_addr + i
+        results.append({
+            "addr": addr,
+            **parse_register(addr, raw),
+        })
+    return results
 
-    def build_heartbeat(self, timestamp_ms: int) -> bytes:
-        return self.build_frame(CmdID.HEARTBEAT, struct.pack('<I', timestamp_ms & 0xFFFFFFFF))
 
-    def build_emergency_stop(self, stop_type: int = 0x00) -> bytes:
-        return self.build_frame(CmdID.EMERGENCY_STOP, bytes([stop_type, 0, 0, 0]))
+# ============================================================
+# 寄存器枚举值
+# ============================================================
 
-    def build_mode_control(self, target_mode: int, enable_mask: int = 0) -> bytes:
-        return self.build_frame(CmdID.MODE_CONTROL, struct.pack('<BI', target_mode, enable_mask))
+CHASSIS_MODE_NAMES = {0: "安全", 1: "开环", 2: "闭环", 3: "从机"}
+
+TOF_STATUS_NAMES = {0: "无效", 1: "有效", 2: "弱信号", 3: "超量程"}
+
+# ============================================================
+# 便捷：获取寄存器值
+# ============================================================
+
+def pack_register(reg_addr: int, fields: dict) -> int:
+    """将字段 dict 打包为 32-bit 寄存器值。"""
+    defs = REGISTER_DEFS.get(reg_addr)
+    if defs is None:
+        return 0
+
+    value = 0
+    for name, (offset, length, kind) in defs.items():
+        if name not in fields:
+            continue
+        field_val = fields[name]
+
+        if kind == 'f':
+            packed = struct.unpack('<I', struct.pack('<f', float(field_val)))[0]
+            value |= (packed & ((1 << 32) - 1))
+        else:
+            mask = (1 << length) - 1
+            if kind == 1 and field_val < 0:
+                field_val = (field_val + (1 << length)) & mask
+            value |= (int(field_val) & mask) << offset
+
+    return value

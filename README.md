@@ -14,26 +14,32 @@
 
 ## 2. 通信协议
 
-本项目的串口通信协议与 [通信协议设计.md](../stair_chapter2/project_data/通信协议设计.md) 完全一致。
+通信协议采用**寄存器地址 + 内容**形式，参考 TI FlexWire 协议改进（取消设备地址段，增加读取长度）。
 
 | 项目 | 说明 |
 |---|---|
 | 物理层 | USB CDC ACM (虚拟串口)，识别为 `/dev/ttyACM0` |
 | 波特率 | 921600 |
-| 帧结构 | SOF(0x5A 0xA5) + Frame_Type + Packet_ID + Payload_Len + Seq_Num + Payload + CRC16 |
+| 读请求 | SYNC(0x55) + SOF(0x5A) + REG_ADDR(1B) + LEN(1B) + CRC16(2B) |
+| 读响应 | SOF(0xA5) + DATA(4B×LEN) + CRC16(2B) |
+| 写请求 | SYNC(0x55) + SOF(0x5A) + REG_ADDR(1B) + LEN(1B) + DATA(4B×LEN) + CRC16(2B) |
 | 字节序 | Little-Endian |
-| 上传带宽 | ≈ 9.8 KB/s（持续流式） |
+| CRC | CRC-16-CCITT（多项式 0x1021，同 MODBUS） |
+| 寄存器位宽 | 32-bit / 寄存器 |
+| 轮询模式 | 主机主动轮询，MCU 响应（非持续流式推送） |
+
+完整寄存器列表见 `read_notes/上下位机通信.xlsx`。
 
 ## 3. 可视化面板
 
-| 面板 | 数据来源 | 刷新率 | 内容 |
+| 面板 | 数据来源（寄存器） | 刷新率 | 内容 |
 |---|---|---|---|
-| 安全状态 | FAST_STATUS | 100Hz | 底盘模式、连接状态、错误标志位、TOF 距离摘要 |
-| TOF 测距 | TOFSENSE_FULL | 50Hz | 4 路 TOF 距离柱状图、信号强度、有效状态 |
-| IMU 姿态 | FAST_STATUS + IMU_ATTITUDE | 100/50Hz | Pitch/Roll 人工地平线、底盘俯仰、温度 |
-| FOC 电机 | FOC_FEEDBACK | 20Hz | 6 路电机在线/速度/扭矩/反馈频率 |
-| 三角轮 | TRIWHEEL_FEEDBACK | 20Hz | 4 轮原始角度 + 滤波角度、底盘俯仰估计 |
-| 事件日志 | EVENT_NOTIFY | 事件驱动 | 模式切换、故障、急停等事件流 |
+| 安全状态 | CTRL(0x00), ONLINE(0x57), TOF(0x11-0x14) | 100Hz | 底盘模式、连接状态、错误标志位、TOF 距离摘要 |
+| TOF 测距 | TOF1-4(0x11-0x14) | 50Hz | 4 路 TOF 距离柱状图、信号强度、有效状态 |
+| IMU 姿态 | IMU_PITCH/ROLL(0x20-0x21) + IMU 全量(0x15-0x28) | 50/20Hz | Pitch/Roll 人工地平线、底盘俯仰、温度 |
+| FOC 电机 | MOTOR_L3~R2(0x29-0x40) | 20Hz | 6 路电机在线/速度/扭矩 |
+| 三角轮 | TRIWHEEL_CUR(0x41-0x44) | 20Hz | 4 轮角度 + 占空比、底盘俯仰估计 |
+| 事件日志 | 寄存器变化检测 | 事件驱动 | 模式切换、故障、TOF 异常等事件流 |
 
 ## 4. 目录结构
 
@@ -42,15 +48,15 @@ stair_viz/
   venv/                      ← Python 虚拟环境
   viz_dashboard/
     __init__.py
-    protocol.py              ← 帧编解码 + CRC16（与 mcu_bridge 100% 复用）
-    serial_driver.py         ← 串口 I/O + 帧状态机
+    protocol.py              ← FlexWire 寄存器读写 + CRC16 + 寄存器字段定义
+    serial_driver.py         ← 串口 I/O + 主动寄存器轮询
+    mock_serial.py           ← MCU 寄存器仿真器（响应读请求）
     viz_server.py            ← FastAPI + WebSocket 服务入口
     static/
       index.html             ← 单页前端仪表盘
-  params/
-    viz_dashboard.params.yaml
-  launch/
-    viz_dashboard.launch.py  ← ROS2 launch 文件（可选）
+  read_notes/                ← 通信协议规范与沟通记录
+    上下位机通信.xlsx
+    通信.txt
   requirements.txt
   README.md
 ```
@@ -72,43 +78,35 @@ source venv/bin/activate
 # 2. 安装依赖（首次）
 pip install -r requirements.txt
 
-# 3. 直接启动（开发模式）
-python viz_dashboard/viz_server.py --port /dev/ttyACM0
+# 3. 模拟模式启动（无需硬件）
+python -m viz_dashboard.viz_server
 
-# 4. 打开浏览器
+# 4. 真实串口模式
+python -m viz_dashboard.viz_server --port /dev/ttyACM0
+
+# 5. 打开浏览器
 # http://localhost:8080
-```
-
-**ROS2 launch 方式**（可选）：
-
-```bash
-cd /home/xpy/stair_chapter2
-source install/setup.bash
-ros2 launch viz_dashboard viz_dashboard.launch.py
 ```
 
 ## 7. 配置参数
 
-`params/viz_dashboard.params.yaml`：
-
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `serial_port` | `/dev/ttyACM0` | 串口设备路径 |
+| `serial_port` | 无（模拟模式） | 串口设备路径，如 `/dev/ttyACM0` |
 | `baud_rate` | `921600` | 虚拟串口波特率 |
 | `web_host` | `0.0.0.0` | Web 服务监听地址 |
 | `web_port` | `8080` | Web 服务端口 |
-| `push_interval_ms` | `20` | WebSocket 推送间隔（毫秒） |
-| `heartbeat_interval_ms` | `100` | 心跳包发送间隔（毫秒） |
+| 寄存器轮询周期 | 5ms/tick | 100Hz(CTRL/Online), 50Hz(TOF/IMU Euler), 20Hz(Motors/Triwheels/IMU) |
 
-## 8. 不仿真联调（无下位机时）
+## 8. 模拟模式（无下位机时）
 
-若暂无 STM32 硬件，可运行模拟数据源进行前端开发调试：
+若暂无 STM32 硬件，直接不带 `--port` 参数启动即可使用内置 MCU 寄存器仿真器：
 
 ```bash
-python viz_dashboard/mock_serial.py
+python -m viz_dashboard.viz_server
 ```
 
-模拟数据源会生成随机但合理的传感器数据，通过 WebSocket 推送到前端。
+仿真器会响应主机的寄存器读请求，返回带噪声的模拟传感器数据（TOF ~230-910mm、IMU ±3° 摆动、电机 ~1200rpm），通过 WebSocket 推送到前端。
 
 ## 9. 后续扩展
 
@@ -120,6 +118,6 @@ python viz_dashboard/mock_serial.py
 
 ## 10. 相关文档
 
-- [通信协议设计](../stair_chapter2/project_data/通信协议设计.md)
-- [必要数据挑选清单](../stair_chapter2/project_data/必要数据挑选清单.md)
-- [上位机可视化规划设计](../stair_chapter2/project_data/上位机可视化规划设计.md)
+- [通信协议规范](read_notes/上下位机通信.xlsx)
+- [上下位机通信说明](read_notes/通信.txt)
+- [项目详解](PROJECT_DETAIL.md)

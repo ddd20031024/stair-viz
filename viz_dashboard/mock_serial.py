@@ -1,7 +1,7 @@
-"""模拟串口数据源 —— 生成合理但随机的传感器数据。
+"""模拟串口数据源 —— MCU 寄存器仿真器。
 
+接收主机读请求，返回模拟的寄存器数据。
 当无下位机硬件时，用于前端开发调试。
-数据遵循通信协议设计 v1.0 的帧格式。
 """
 
 import math
@@ -9,140 +9,173 @@ import random
 import struct
 import time
 import threading
+from collections import deque
 
 from viz_dashboard.protocol import (
-    SOF1, SOF2, DIR_UPLOAD, crc16_ccitt,
-    PacketID, ChassisMode,
+    SYNC, SOF_HOST, SOF_MCU,
+    crc16_ccitt,
+    RegAddr,
+    parse_register,
+    pack_register,
 )
 
 
-def _build_frame(packet_id: int, payload: bytes, seq: int) -> bytes:
-    frame_type = packet_id  # upload direction, bit7=0
-    header = bytes([frame_type]) + struct.pack('<H', len(payload)) + bytes([seq])
-    crc = crc16_ccitt(header + payload)
-    return bytes([SOF1, SOF2]) + header + payload + struct.pack('<H', crc)
+def _build_read_response(reg_addr: int, values: list) -> bytes:
+    """构建读响应帧: SOF(0xA5) + DATA(4B×N) + CRC16(2B)"""
+    data = b''.join(struct.pack('<I', v) for v in values)
+    crc = crc16_ccitt(data)
+    return bytes([SOF_MCU]) + data + struct.pack('<H', crc)
 
 
 class MockSerial:
-    """伪装成 pyserial.Serial，read(1) 返回模拟帧字节。"""
+    """伪装成 pyserial.Serial，write() 接收请求，read() 返回响应字节。"""
 
     def __init__(self):
         self.is_open = True
-        self._buf = bytearray()
+        self._read_buf = bytearray()
         self._lock = threading.Lock()
-        self._seq = 0
         self._stop = False
-        self._thread = threading.Thread(target=self._generator, daemon=True)
 
-        # 模拟状态
+        # 模拟时间
         self._t = 0.0
-        self._mode = ChassisMode.CLOSED_LOOP
-        self._error_flags = 0
-        self._tof_distances = [850, 820, 910, 230]   # mm
-        self._tof_status = [1, 1, 1, 2]
-        self._tof_signals = [200, 180, 210, 90]
 
+        # 模拟错误标志（随机翻转）
+        self._error_flags = 0
+
+        # 模拟 TOF 基线
+        self._tof_bases = [850, 820, 910, 230]
+
+        # 在线状态
+        self._online = 0x7FFF  # bits 0-14 all 1
+
+        # 请求解析状态机
+        self._req_state = 0       # 0=idle, 1=got_55, 2=got_5A, 3=reading
+        self._req_buf = bytearray()
+        self._req_payload_len = 0
+
+        self._thread = threading.Thread(target=self._tick_loop, daemon=True)
         self._thread.start()
 
     def read(self, n: int = 1) -> bytes:
         while True:
             with self._lock:
-                if len(self._buf) >= n:
-                    result = bytes(self._buf[:n])
-                    del self._buf[:n]
+                if len(self._read_buf) >= n:
+                    result = bytes(self._read_buf[:n])
+                    del self._read_buf[:n]
                     return result
-            time.sleep(0.001)
+            time.sleep(0.0005)
+
+    def write(self, data: bytes):
+        """接收主机发来的字节，解析请求并生成响应。"""
+        for byte in data:
+            self._feed_request(byte)
 
     def close(self):
         self._stop = True
         self.is_open = False
 
-    def _enqueue(self, data: bytes):
+    def _enqueue_response(self, data: bytes):
         with self._lock:
-            self._buf.extend(data)
+            self._read_buf.extend(data)
 
-    def _next_seq(self) -> int:
-        self._seq = (self._seq + 1) & 0xFF
-        return self._seq
+    # ------------------------------------------------------------
+    # 请求解析状态机
+    # ------------------------------------------------------------
 
-    def _generator(self):
-        """按调度表生成模拟帧。"""
+    def _feed_request(self, byte: int):
+        """解析主机请求帧: 0x55 0x5A ADDR LEN CRC16"""
+        b = byte & 0xFF
+
+        if self._req_state == 0:
+            if b == SYNC:
+                self._req_state = 1
+            return
+
+        if self._req_state == 1:
+            if b == SOF_HOST:
+                self._req_state = 2
+                self._req_buf = bytearray()
+            else:
+                self._req_state = 0
+            return
+
+        if self._req_state == 2:
+            # REG_ADDR
+            self._req_buf.append(b)
+            self._req_state = 3
+            return
+
+        # state == 3: LEN + CRC16
+        self._req_buf.append(b)
+        if len(self._req_buf) >= 4:
+            # REG_ADDR(1) + LEN(1) + CRC16(2)
+            reg_addr = self._req_buf[0]
+            length = self._req_buf[1]
+            crc_received = struct.unpack_from('<H', self._req_buf, 2)[0]
+            self._req_state = 0
+
+            crc_expected = crc16_ccitt(bytes(self._req_buf[:2]))
+            if crc_received == crc_expected:
+                self._handle_read_request(reg_addr, length)
+
+    def _handle_read_request(self, reg_addr: int, length: int):
+        """生成模拟寄存器数据并返回响应。"""
+        values = []
+        for i in range(length):
+            addr = reg_addr + i
+            val = self._gen_register(addr)
+            values.append(val)
+        resp = _build_read_response(reg_addr, values)
+        self._enqueue_response(resp)
+
+    # ------------------------------------------------------------
+    # 模拟数据生成
+    # ------------------------------------------------------------
+
+    def _tick_loop(self):
+        """后台更新模拟状态。"""
         tick = 0
         while not self._stop:
-            try:
-                if tick % 10 == 0:
-                    self._gen_fast_status()
-                if tick % 20 == 5:
-                    self._gen_tofsense_full()
-                if tick % 20 == 15:
-                    self._gen_imu_attitude()
-                if tick % 50 == 10:
-                    self._gen_foc_feedback()
-                if tick % 50 == 35:
-                    self._gen_triwheel_feedback()
-                if tick % 100 == 50:
-                    self._gen_drv8701_feedback()
+            self._t += 0.005
 
-                # 模拟偶尔的事件
-                if tick > 0 and tick % 500 == 0:
-                    self._gen_event()
+            # 偶尔翻转错误位
+            if tick > 0 and tick % 600 == 0:
+                self._error_flags ^= (1 << random.randint(0, 8))
 
-                tick += 1
-                if tick >= 100:
-                    tick = 0
-                self._t += 0.001
+            tick += 1
+            if tick >= 1000:
+                tick = 0
+            time.sleep(0.005)  # 200Hz
 
-                time.sleep(0.001)   # ~1kHz 调度
-            except Exception:
-                break
+    def _gen_register(self, addr: int) -> int:
+        t = self._t
 
-    def _gen_fast_status(self):
-        d0 = self._tof_distances
-        valid_distances = [d for d, s in zip(d0, self._tof_status) if s == 1 and d > 0]
-        tof_valid = len(valid_distances)
-        tof_min = min(valid_distances) if valid_distances else 0
-        tof_max = max(valid_distances) if valid_distances else 0
+        if addr == RegAddr.CTRL:
+            return pack_register(RegAddr.CTRL, {
+                "chassis_mode": 2,  # 闭环
+                "foc_enable": 1,
+                "brushed_enable": 0,
+                "foc_ctrl_mode": 0,
+                "brushed_ctrl_mode": 0,
+            })
 
-        # 模拟小幅波动
-        pitch = round(math.sin(self._t * 2.0) * 3.0, 1)
-        roll = round(math.cos(self._t * 1.7) * 1.5, 1)
-        chassis_p = round(pitch * 0.9, 1)
+        if addr == RegAddr.ONLINE_STATUS:
+            return self._online
 
-        payload = struct.pack('<BBHHHBBB',
-            self._mode,         # chassis_mode
-            0x42,               # heartbeat_echo
-            self._error_flags,  # error_flags
-            tof_min,
-            tof_max,
-            tof_valid,
-            int(pitch * 10) & 0xFF,
-            int(roll * 10) & 0xFF,
-            int(chassis_p * 10) & 0xFF,
-        )
-        payload += b'\x00' * 11   # reserved[11] + pad to 24B
-        self._enqueue(_build_frame(PacketID.FAST_STATUS, payload, self._next_seq()))
-
-    def _gen_tofsense_full(self):
-        # 添加噪声
-        noisy = []
-        for i in range(4):
-            base = self._tof_distances[i]
+        # ---- TOF ----
+        if RegAddr.TOF1 <= addr <= RegAddr.TOF4:
+            idx = addr - RegAddr.TOF1
+            base = self._tof_bases[idx]
             dist = max(0, int(base + random.gauss(0, 15)))
-            status = self._tof_status[i]
-            signal = max(0, min(255, int(self._tof_signals[i] + random.gauss(0, 5))))
-            noisy.append((dist, status, signal))
+            signal = max(0, min(255, int([200, 180, 210, 90][idx] + random.gauss(0, 5))))
+            status = 1 if dist > 50 else 0
+            fault = 0 if dist > 30 else 1
+            return (dist << 16) | (signal << 8) | (status << 5) | (fault << 4)
 
-        payload = bytearray()
-        for dist, status, signal in noisy:
-            payload += struct.pack('<HBB', dist, status, signal)
-        self._enqueue(_build_frame(PacketID.TOFSENSE_FULL, bytes(payload), self._next_seq()))
-
-    def _gen_imu_attitude(self):
-        pitch = math.sin(self._t * 2.0) * 3.0
-        roll = math.cos(self._t * 1.7) * 1.5
-        yaw = self._t * 10.0
-
-        # 欧拉 → 四元数
+        # ---- IMU ----
+        pitch = math.sin(t * 2.0) * 3.0
+        roll = math.cos(t * 1.7) * 1.5
+        yaw = t * 10.0
         cy = math.cos(math.radians(yaw) / 2)
         sy = math.sin(math.radians(yaw) / 2)
         cp = math.cos(math.radians(pitch) / 2)
@@ -154,60 +187,85 @@ class MockSerial:
         qy = cr * sp * cy + sr * cp * sy
         qz = cr * cp * sy - sr * sp * cy
 
-        payload = struct.pack('<fffffffffff',
-            qw, qx, qy, qz,
-            random.gauss(0, 0.05), random.gauss(0, 0.05), random.gauss(0, 0.05),
-            random.gauss(0, 0.02), random.gauss(0, 0.02), random.gauss(0.98, 0.02),
-            35.0 + random.gauss(0, 0.5),
-        )
-        self._enqueue(_build_frame(PacketID.IMU_ATTITUDE, payload, self._next_seq()))
+        imu_map = {
+            RegAddr.IMU_QUAT_W: qw,
+            RegAddr.IMU_QUAT_X: qx,
+            RegAddr.IMU_QUAT_Y: qy,
+            RegAddr.IMU_QUAT_Z: qz,
+            RegAddr.IMU_YAW: math.degrees(yaw) % 360,
+            RegAddr.IMU_PITCH: pitch,
+            RegAddr.IMU_ROLL: roll,
+            RegAddr.IMU_GYRO_YAW: random.gauss(0, 0.05),
+            RegAddr.IMU_GYRO_PITCH: random.gauss(0, 0.05),
+            RegAddr.IMU_GYRO_ROLL: random.gauss(0, 0.05),
+            RegAddr.IMU_ACCEL_X: random.gauss(0, 0.02),
+            RegAddr.IMU_ACCEL_Y: random.gauss(0, 0.02),
+            RegAddr.IMU_ACCEL_Z: 0.98 + random.gauss(0, 0.02),
+            RegAddr.IMU_TEMP: 35.0 + random.gauss(0, 0.5),
+        }
+        if addr in imu_map:
+            return struct.unpack('<I', struct.pack('<f', imu_map[addr]))[0]
 
-    def _gen_foc_feedback(self):
-        payload = bytearray()
-        for m in range(6):
-            online = 1
-            vel = int((1200 + random.gauss(0, 30)) * 10)  # scaled ×10
-            torque = int(random.gauss(0, 100))
-            fb_hz = 900 + int(random.gauss(0, 20))
-            payload += struct.pack('<BhHH',
-                online,
-                vel,
-                max(-1000, min(1000, torque)),
-                max(0, min(2000, fb_hz)),
-            )
-        self._enqueue(_build_frame(PacketID.FOC_FEEDBACK, bytes(payload), self._next_seq()))
+        # ---- 驱动电机反馈 (0x29-0x34) ----
+        # 电机顺序: L3, L4, L5, R0, R1, R2
+        motor_index_map = {
+            RegAddr.MOTOR_L3_TORQUE_SPEED: 0,
+            RegAddr.MOTOR_L4_TORQUE_SPEED: 1,
+            RegAddr.MOTOR_L5_TORQUE_SPEED: 2,
+            RegAddr.MOTOR_R0_TORQUE_SPEED: 3,
+            RegAddr.MOTOR_R1_TORQUE_SPEED: 4,
+            RegAddr.MOTOR_R2_TORQUE_SPEED: 5,
+        }
 
-    def _gen_triwheel_feedback(self):
-        payload = bytearray()
-        chassis_pitch_deg = math.sin(self._t * 2.0) * 3.0
-        for w in range(4):
-            base_angle = 45.0 if w in (0, 2) else -45.0
-            angle = base_angle + random.gauss(0, 0.5)
-            filtered = angle + random.gauss(0, 0.1)
-            payload += struct.pack('<ff', angle, filtered)
-        payload += struct.pack('<f', chassis_pitch_deg)
-        self._enqueue(_build_frame(PacketID.TRIWHEEL_FEEDBACK, bytes(payload), self._next_seq()))
+        if addr in motor_index_map:
+            # speed: rad/s × 16 (电角度速度), ~120 rad/s → ~1920 raw → ~1146 rpm
+            speed_rads = 120.0 + random.gauss(0, 3)
+            speed_raw = int(speed_rads * 16)
+            torque_raw = int(random.gauss(0, 100))
+            speed_raw = max(-32768, min(32767, speed_raw))
+            torque_raw = max(-32768, min(32767, torque_raw))
+            return ((torque_raw & 0xFFFF) << 16) | (speed_raw & 0xFFFF)
 
-    def _gen_drv8701_feedback(self):
-        payload = bytearray()
-        for m in range(6):
-            enabled = 1 if m < 4 else 0
-            mode = 0
-            direction = -1 if m in (0, 2) else 1
-            duty = int(random.uniform(0.3, 0.7) * 1000)
-            current = int(random.gauss(500, 100))
-            payload += struct.pack('<BBbhh',
-                enabled, mode, direction,
-                max(0, min(1000, duty)),
-                max(0, min(5000, current)),
-            )
-        self._enqueue(_build_frame(PacketID.DRV8701_FEEDBACK, bytes(payload), self._next_seq()))
+        # Motor angle registers
+        motor_angle_regs = {
+            RegAddr.MOTOR_L3_ANGLE: 0, RegAddr.MOTOR_L4_ANGLE: 1,
+            RegAddr.MOTOR_L5_ANGLE: 2, RegAddr.MOTOR_R0_ANGLE: 3,
+            RegAddr.MOTOR_R1_ANGLE: 4, RegAddr.MOTOR_R2_ANGLE: 5,
+        }
+        if addr in motor_angle_regs:
+            idx = motor_angle_regs[addr]
+            angle = t * (12.0 + idx * 0.5)
+            return struct.unpack('<I', struct.pack('<f', angle))[0]
 
-    def _gen_event(self):
-        # 随机生成一个事件
-        event_type = random.choice([1, 5])
-        if event_type == 1:
-            payload = struct.pack('<BBI', 1, self._mode, 0)
-        else:
-            payload = struct.pack('<BBI', 5, 0, 0)
-        self._enqueue(_build_frame(PacketID.EVENT_NOTIFY, payload, self._next_seq()))
+        # ---- 三角轮反馈 ----
+        if addr == RegAddr.TRIWHEEL_ANGLE_CUR_FRONT:
+            la = int((45.0 + random.gauss(0, 0.5)) * 100)
+            ra = int((-45.0 + random.gauss(0, 0.5)) * 100)
+            return ((la & 0xFFFF) << 16) | (ra & 0xFFFF)
+        if addr == RegAddr.TRIWHEEL_ANGLE_CUR_REAR:
+            la = int((45.0 + random.gauss(0, 0.5)) * 100)
+            ra = int((-45.0 + random.gauss(0, 0.5)) * 100)
+            return ((la & 0xFFFF) << 16) | (ra & 0xFFFF)
+
+        if addr == RegAddr.TRIWHEEL_DUTY_CUR_FRONT:
+            ld = int(random.uniform(-0.5, 0.5) * 1000)
+            rd = int(random.uniform(-0.5, 0.5) * 1000)
+            return ((ld & 0xFFFF) << 16) | (rd & 0xFFFF)
+        if addr == RegAddr.TRIWHEEL_DUTY_CUR_REAR:
+            ld = int(random.uniform(-0.5, 0.5) * 1000)
+            rd = int(random.uniform(-0.5, 0.5) * 1000)
+            return ((ld & 0xFFFF) << 16) | (rd & 0xFFFF)
+
+        # ---- 角加速度计 ----
+        accel_map = {
+            RegAddr.ACCEL_LF_X: (0.02, 0.02), RegAddr.ACCEL_LF_Y: (0.02, 0.02), RegAddr.ACCEL_LF_Z: (0.98, 0.02),
+            RegAddr.ACCEL_RF_X: (0.02, 0.02), RegAddr.ACCEL_RF_Y: (0.02, 0.02), RegAddr.ACCEL_RF_Z: (0.98, 0.02),
+            RegAddr.ACCEL_LR_X: (0.02, 0.02), RegAddr.ACCEL_LR_Y: (0.02, 0.02), RegAddr.ACCEL_LR_Z: (0.98, 0.02),
+            RegAddr.ACCEL_RR_X: (0.02, 0.02), RegAddr.ACCEL_RR_Y: (0.02, 0.02), RegAddr.ACCEL_RR_Z: (0.98, 0.02),
+        }
+        if addr in accel_map:
+            mean, std = accel_map[addr]
+            return struct.unpack('<I', struct.pack('<f', mean + random.gauss(0, std)))[0]
+
+        # ---- 未定义的寄存器 ----
+        return 0
