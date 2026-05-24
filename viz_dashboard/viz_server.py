@@ -73,15 +73,29 @@ _MOTOR_ORDER = ["L3", "L4", "L5", "R0", "R1", "R2"]
 # 三角轮映射: Excel 中 lf/rf/lr/rr → 前端 triwheels[0..3]
 _TRIWHEEL_ORDER = ["lf", "rf", "lr", "rr"]
 
-# 电机扭矩/速度寄存器地址 (torque+speed pairs)
-_MOTOR_TORQUE_SPEED_ADDRS = [29, 31, 33, 35, 37, 39]  # L3, L4, L5, R0, R1, R2
-_MOTOR_ANGLE_ADDRS = [30, 32, 34, 36, 38, 40]
+# 电机扭矩/速度寄存器地址 (torque+speed pairs) — 新协议地址
+_MOTOR_TORQUE_SPEED_ADDRS = [
+    RegAddr.MOTOR_L3_TORQUE_SPEED,  # 35
+    RegAddr.MOTOR_L4_TORQUE_SPEED,  # 37
+    RegAddr.MOTOR_L5_TORQUE_SPEED,  # 39
+    RegAddr.MOTOR_R0_TORQUE_SPEED,  # 41
+    RegAddr.MOTOR_R1_TORQUE_SPEED,  # 43
+    RegAddr.MOTOR_R2_TORQUE_SPEED,  # 45
+]
+_MOTOR_ANGLE_ADDRS = [
+    RegAddr.MOTOR_L3_ANGLE,  # 36
+    RegAddr.MOTOR_L4_ANGLE,  # 38
+    RegAddr.MOTOR_L5_ANGLE,  # 40
+    RegAddr.MOTOR_R0_ANGLE,  # 42
+    RegAddr.MOTOR_R1_ANGLE,  # 44
+    RegAddr.MOTOR_R2_ANGLE,  # 46
+]
 
 # 三角轮角度/占空比寄存器
-_TRIWHEEL_ANGLE_FRONT_ADDR = 41
-_TRIWHEEL_ANGLE_REAR_ADDR = 42
-_TRIWHEEL_DUTY_FRONT_ADDR = 43
-_TRIWHEEL_DUTY_REAR_ADDR = 44
+_TRIWHEEL_ANGLE_FRONT_ADDR = RegAddr.TRIWHEEL_ANGLE_CUR_FRONT   # 47
+_TRIWHEEL_ANGLE_REAR_ADDR = RegAddr.TRIWHEEL_ANGLE_CUR_REAR     # 48
+_TRIWHEEL_DUTY_FRONT_ADDR = RegAddr.TRIWHEEL_DUTY_CUR_FRONT     # 49
+_TRIWHEEL_DUTY_REAR_ADDR = RegAddr.TRIWHEEL_DUTY_CUR_REAR       # 50
 
 _prev_chassis_mode = 0
 _prev_tof_faults = [0, 0, 0, 0]
@@ -166,11 +180,11 @@ def _update_state(reg_addr: int, results: List[dict]):
             elif addr == RegAddr.IMU_GYRO_ROLL:
                 mcu_state["imu"]["gyro_x_dps"] = reg.get("gyro_roll_dps", 0.0)
             elif addr == RegAddr.IMU_ACCEL_X:
-                mcu_state["imu"]["accel_x_g"] = reg.get("accel_x_g", 0.0)
+                mcu_state["imu"]["accel_x_g"] = reg.get("accel_x_ms2", 0.0)
             elif addr == RegAddr.IMU_ACCEL_Y:
-                mcu_state["imu"]["accel_y_g"] = reg.get("accel_y_g", 0.0)
+                mcu_state["imu"]["accel_y_g"] = reg.get("accel_y_ms2", 0.0)
             elif addr == RegAddr.IMU_ACCEL_Z:
-                mcu_state["imu"]["accel_z_g"] = reg.get("accel_z_g", 0.0)
+                mcu_state["imu"]["accel_z_g"] = reg.get("accel_z_ms2", 0.0)
             elif addr == RegAddr.IMU_TEMP:
                 mcu_state["imu"]["temperature_c"] = reg.get("temperature_c", 0.0)
 

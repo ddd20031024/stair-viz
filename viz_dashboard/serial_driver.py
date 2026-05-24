@@ -8,7 +8,7 @@ import time
 from typing import Optional, Callable, List
 
 from viz_dashboard.protocol import (
-    SYNC, SOF_HOST, SOF_MCU,
+    crc8,
     build_read_request, parse_response,
     RegAddr,
 )
@@ -92,7 +92,7 @@ class SerialDriver:
             self._serial = None
 
     def send(self, frame: bytes):
-        """发送命令帧到串口（线程安全）。线程安全。"""
+        """发送命令帧到串口（线程安全）。"""
         if self._serial and self._serial.is_open:
             with self._lock:
                 try:
@@ -135,21 +135,15 @@ class SerialDriver:
         return length * 4
 
     def _read_response(self, expected_data_len: int, timeout: float = 0.05) -> Optional[bytes]:
-        """从串口读取响应帧，返回 data bytes 或 None。"""
+        """从串口读取响应帧，返回 data bytes 或 None。
+
+        新协议响应: DATA(4B×N) | CRC8(1B)，无帧头。
+        """
+        to_read = expected_data_len + 1  # data + CRC8
         data_buf = bytearray()
-        deadline = time.time() + timeout
+        deadline = time.time() + timeout + 0.05
 
-        # 等待 SOF
-        while time.time() < deadline:
-            b = self._serial.read(1)
-            if b and b[0] == SOF_MCU:
-                break
-        else:
-            return None
-
-        # 读取 data + CRC16
-        to_read = expected_data_len + 2
-        while len(data_buf) < to_read and time.time() < deadline + 0.05:
+        while len(data_buf) < to_read and time.time() < deadline:
             chunk = self._serial.read(to_read - len(data_buf))
             if chunk:
                 data_buf.extend(chunk)
@@ -157,33 +151,31 @@ class SerialDriver:
         if len(data_buf) < to_read:
             return None
 
-        from viz_dashboard.protocol import crc16_ccitt
-        import struct
-        data = bytes(data_buf[:expected_data_len])
-        crc_received = struct.unpack_from('<H', data_buf, expected_data_len)[0]
-        crc_expected = crc16_ccitt(data)
+        payload = bytes(data_buf[:expected_data_len])
+        crc_received = data_buf[expected_data_len]
+        crc_expected = crc8(payload)
 
         if crc_received != crc_expected:
             with self._lock:
                 self._crc_errors += 1
             return None
 
-        return data
+        return payload
 
     # --------------------------------------------------------
     # 后台轮询循环
     # --------------------------------------------------------
 
     # 轮询调度表: (周期 ticks, 寄存器地址, 读取长度, 名称)
-    # tick = 5ms, 所以 2 ticks = 100Hz, 4 = 50Hz, 10 = 20Hz
+    # tick = 5ms, 2 ticks = 100Hz, 4 = 50Hz, 10 = 20Hz
     _POLL_SCHEDULE = [
-        (2, RegAddr.CTRL, 1, "ctrl"),                     # 0
-        (2, RegAddr.ONLINE_STATUS, 1, "online"),          # 57
-        (4, RegAddr.TOF1, 4, "tof"),                      # 11-14
-        (4, RegAddr.IMU_PITCH, 2, "imu_euler"),           # 20-21
-        (10, RegAddr.MOTOR_L3_TORQUE_SPEED, 12, "motors"), # 29-40
-        (10, RegAddr.TRIWHEEL_ANGLE_CUR_FRONT, 4, "triwheels"),  # 41-44
-        (10, RegAddr.IMU_QUAT_W, 14, "imu_full"),          # 15-28
+        (2, RegAddr.CTRL, 1, "ctrl"),                              # 0x00
+        (2, RegAddr.ONLINE_STATUS, 1, "online"),                   # 0x52
+        (4, RegAddr.TOF1, 4, "tof"),                               # 0x11-0x14
+        (4, RegAddr.IMU_PITCH, 2, "imu_euler"),                    # 0x1A-0x1B
+        (10, RegAddr.MOTOR_L3_TORQUE_SPEED, 12, "motors"),         # 0x23-0x2E
+        (10, RegAddr.TRIWHEEL_ANGLE_CUR_FRONT, 4, "triwheels"),    # 0x2F-0x32
+        (10, RegAddr.IMU_QUAT_W, 14, "imu_full"),                  # 0x15-0x22
     ]
 
     def _poll_loop(self):
@@ -218,10 +210,8 @@ class SerialDriver:
                     if self.connected and (time.time() - self._last_response_time) > 0.3:
                         self.connected = False
 
-                # 避免一个 tick 内请求过于密集
                 time.sleep(0.001)
 
-            # 维持 ~200Hz tick (5ms)
             elapsed = time.time() - loop_start
             sleep_time = 0.005 - elapsed
             if sleep_time > 0:

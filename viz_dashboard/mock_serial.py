@@ -9,11 +9,10 @@ import random
 import struct
 import time
 import threading
-from collections import deque
 
 from viz_dashboard.protocol import (
-    SYNC, SOF_HOST, SOF_MCU,
-    crc16_ccitt,
+    SYNC, CMD_READ, CMD_WRITE,
+    crc8,
     RegAddr,
     parse_register,
     pack_register,
@@ -21,10 +20,10 @@ from viz_dashboard.protocol import (
 
 
 def _build_read_response(reg_addr: int, values: list) -> bytes:
-    """构建读响应帧: SOF(0xA5) + DATA(4B×N) + CRC16(2B)"""
+    """构建读响应帧: DATA(4B×N) | CRC8(1B)（新协议无帧头）。"""
     data = b''.join(struct.pack('<I', v) for v in values)
-    crc = crc16_ccitt(data)
-    return bytes([SOF_MCU]) + data + struct.pack('<H', crc)
+    crc = crc8(data)
+    return data + bytes([crc])
 
 
 class MockSerial:
@@ -36,7 +35,6 @@ class MockSerial:
         self._lock = threading.Lock()
         self._stop = False
 
-        # 模拟时间
         self._t = 0.0
 
         # 模拟错误标志（随机翻转）
@@ -45,13 +43,15 @@ class MockSerial:
         # 模拟 TOF 基线
         self._tof_bases = [850, 820, 910, 230]
 
-        # 在线状态
-        self._online = 0x7FFF  # bits 0-14 all 1
+        # 在线状态 (MSB 对齐: bits 31..17)
+        self._online = 0
+        for bit in [31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17]:
+            self._online |= (1 << bit)
 
-        # 请求解析状态机
-        self._req_state = 0       # 0=idle, 1=got_55, 2=got_5A, 3=reading
-        self._req_buf = bytearray()
-        self._req_payload_len = 0
+        # 请求解析: SYNC(0x55) | CMD(1B) | REG_ADDR(1B) | LEN(1B) | CRC8(1B)
+        self._req_state = 0       # 0=SYNC, 1=CMD, 2=ADDR, 3=LEN, 4=CRC
+        self._req_cmd = 0
+        self._req_addr = 0
 
         self._thread = threading.Thread(target=self._tick_loop, daemon=True)
         self._thread.start()
@@ -79,11 +79,10 @@ class MockSerial:
             self._read_buf.extend(data)
 
     # ------------------------------------------------------------
-    # 请求解析状态机
+    # 请求解析状态机: 0x55 | CMD | ADDR | LEN | CRC8
     # ------------------------------------------------------------
 
     def _feed_request(self, byte: int):
-        """解析主机请求帧: 0x55 0x5A ADDR LEN CRC16"""
         b = byte & 0xFF
 
         if self._req_state == 0:
@@ -92,34 +91,30 @@ class MockSerial:
             return
 
         if self._req_state == 1:
-            if b == SOF_HOST:
-                self._req_state = 2
-                self._req_buf = bytearray()
-            else:
-                self._req_state = 0
+            self._req_cmd = b
+            self._req_state = 2
             return
 
         if self._req_state == 2:
-            # REG_ADDR
-            self._req_buf.append(b)
+            self._req_addr = b
             self._req_state = 3
             return
 
-        # state == 3: LEN + CRC16
-        self._req_buf.append(b)
-        if len(self._req_buf) >= 4:
-            # REG_ADDR(1) + LEN(1) + CRC16(2)
-            reg_addr = self._req_buf[0]
-            length = self._req_buf[1]
-            crc_received = struct.unpack_from('<H', self._req_buf, 2)[0]
-            self._req_state = 0
+        if self._req_state == 3:
+            self._req_len = b
+            self._req_state = 4
+            return
 
-            crc_expected = crc16_ccitt(bytes(self._req_buf[:2]))
-            if crc_received == crc_expected:
-                self._handle_read_request(reg_addr, length)
+        # state == 4: CRC8
+        self._req_state = 0
+        crc_received = b
+        header = bytes([SYNC, self._req_cmd, self._req_addr, self._req_len])
+        crc_expected = crc8(header)
+        if crc_received == crc_expected:
+            if self._req_cmd == CMD_READ:
+                self._handle_read_request(self._req_addr, self._req_len)
 
     def _handle_read_request(self, reg_addr: int, length: int):
-        """生成模拟寄存器数据并返回响应。"""
         values = []
         for i in range(length):
             addr = reg_addr + i
@@ -133,51 +128,54 @@ class MockSerial:
     # ------------------------------------------------------------
 
     def _tick_loop(self):
-        """后台更新模拟状态。"""
         tick = 0
         while not self._stop:
             self._t += 0.005
 
-            # 偶尔翻转错误位
             if tick > 0 and tick % 600 == 0:
                 self._error_flags ^= (1 << random.randint(0, 8))
 
             tick += 1
             if tick >= 1000:
                 tick = 0
-            time.sleep(0.005)  # 200Hz
+            time.sleep(0.005)
 
     def _gen_register(self, addr: int) -> int:
         t = self._t
 
         if addr == RegAddr.CTRL:
             return pack_register(RegAddr.CTRL, {
-                "chassis_mode": 2,  # 闭环
+                "chassis_mode": 2,
                 "foc_enable": 1,
                 "brushed_enable": 0,
                 "foc_ctrl_mode": 0,
-                "brushed_ctrl_mode": 0,
+                "triwheel_ctrl_mode": 0,
             })
 
         if addr == RegAddr.ONLINE_STATUS:
             return self._online
 
-        # ---- TOF ----
+        # ---- 云台控制 ----
+        if addr == RegAddr.GIMBAL_DUTY:
+            return 0
+
+        # ---- TOF (0x11-0x14) ----
         if RegAddr.TOF1 <= addr <= RegAddr.TOF4:
             idx = addr - RegAddr.TOF1
             base = self._tof_bases[idx]
             dist = max(0, int(base + random.gauss(0, 15)))
             signal = max(0, min(255, int([200, 180, 210, 90][idx] + random.gauss(0, 5))))
             status = 1 if dist > 50 else 0
-            fault = 0 if dist > 30 else 1
-            return (dist << 16) | (signal << 8) | (status << 5) | (fault << 4)
+            fault = 0 if dist > 30 else random.choice([0, 1])
+            return (dist << 16) | (signal << 8) | (status << 4) | fault
 
-        # ---- IMU ----
+        # ---- 底盘 IMU (0x15-0x22) ----
         pitch = math.sin(t * 2.0) * 3.0
         roll = math.cos(t * 1.7) * 1.5
-        yaw = t * 10.0
-        cy = math.cos(math.radians(yaw) / 2)
-        sy = math.sin(math.radians(yaw) / 2)
+        yaw = (t * 10.0) % 360
+        yaw_rad = math.radians(yaw)
+        cy = math.cos(yaw_rad / 2)
+        sy = math.sin(yaw_rad / 2)
         cp = math.cos(math.radians(pitch) / 2)
         sp = math.sin(math.radians(pitch) / 2)
         cr = math.cos(math.radians(roll) / 2)
@@ -192,48 +190,38 @@ class MockSerial:
             RegAddr.IMU_QUAT_X: qx,
             RegAddr.IMU_QUAT_Y: qy,
             RegAddr.IMU_QUAT_Z: qz,
-            RegAddr.IMU_YAW: math.degrees(yaw) % 360,
+            RegAddr.IMU_YAW: yaw,
             RegAddr.IMU_PITCH: pitch,
             RegAddr.IMU_ROLL: roll,
             RegAddr.IMU_GYRO_YAW: random.gauss(0, 0.05),
             RegAddr.IMU_GYRO_PITCH: random.gauss(0, 0.05),
             RegAddr.IMU_GYRO_ROLL: random.gauss(0, 0.05),
-            RegAddr.IMU_ACCEL_X: random.gauss(0, 0.02),
-            RegAddr.IMU_ACCEL_Y: random.gauss(0, 0.02),
-            RegAddr.IMU_ACCEL_Z: 0.98 + random.gauss(0, 0.02),
+            RegAddr.IMU_ACCEL_X: random.gauss(0, 0.2),
+            RegAddr.IMU_ACCEL_Y: random.gauss(0, 0.2),
+            RegAddr.IMU_ACCEL_Z: 9.8 + random.gauss(0, 0.2),
             RegAddr.IMU_TEMP: 35.0 + random.gauss(0, 0.5),
         }
         if addr in imu_map:
             return struct.unpack('<I', struct.pack('<f', imu_map[addr]))[0]
 
-        # ---- 驱动电机反馈 (0x29-0x34) ----
-        # 电机顺序: L3, L4, L5, R0, R1, R2
-        motor_index_map = {
-            RegAddr.MOTOR_L3_TORQUE_SPEED: 0,
-            RegAddr.MOTOR_L4_TORQUE_SPEED: 1,
-            RegAddr.MOTOR_L5_TORQUE_SPEED: 2,
-            RegAddr.MOTOR_R0_TORQUE_SPEED: 3,
-            RegAddr.MOTOR_R1_TORQUE_SPEED: 4,
-            RegAddr.MOTOR_R2_TORQUE_SPEED: 5,
-        }
-
-        if addr in motor_index_map:
-            # speed: rad/s × 16 (电角度速度), ~120 rad/s → ~1920 raw → ~1146 rpm
+        # ---- 驱动电机反馈 ----
+        motor_ts_addrs = [
+            RegAddr.MOTOR_L3_TORQUE_SPEED, RegAddr.MOTOR_L4_TORQUE_SPEED,
+            RegAddr.MOTOR_L5_TORQUE_SPEED, RegAddr.MOTOR_R0_TORQUE_SPEED,
+            RegAddr.MOTOR_R1_TORQUE_SPEED, RegAddr.MOTOR_R2_TORQUE_SPEED,
+        ]
+        if addr in motor_ts_addrs:
             speed_rads = 120.0 + random.gauss(0, 3)
-            speed_raw = int(speed_rads * 16)
-            torque_raw = int(random.gauss(0, 100))
-            speed_raw = max(-32768, min(32767, speed_raw))
-            torque_raw = max(-32768, min(32767, torque_raw))
+            speed_raw = max(-32768, min(32767, int(speed_rads * 16)))
+            torque_raw = max(-32768, min(32767, int(random.gauss(0, 100))))
             return ((torque_raw & 0xFFFF) << 16) | (speed_raw & 0xFFFF)
 
-        # Motor angle registers
-        motor_angle_regs = {
-            RegAddr.MOTOR_L3_ANGLE: 0, RegAddr.MOTOR_L4_ANGLE: 1,
-            RegAddr.MOTOR_L5_ANGLE: 2, RegAddr.MOTOR_R0_ANGLE: 3,
-            RegAddr.MOTOR_R1_ANGLE: 4, RegAddr.MOTOR_R2_ANGLE: 5,
-        }
-        if addr in motor_angle_regs:
-            idx = motor_angle_regs[addr]
+        motor_angle_addrs = [
+            RegAddr.MOTOR_L3_ANGLE, RegAddr.MOTOR_L4_ANGLE, RegAddr.MOTOR_L5_ANGLE,
+            RegAddr.MOTOR_R0_ANGLE, RegAddr.MOTOR_R1_ANGLE, RegAddr.MOTOR_R2_ANGLE,
+        ]
+        if addr in motor_angle_addrs:
+            idx = motor_angle_addrs.index(addr)
             angle = t * (12.0 + idx * 0.5)
             return struct.unpack('<I', struct.pack('<f', angle))[0]
 
@@ -246,7 +234,6 @@ class MockSerial:
             la = int((45.0 + random.gauss(0, 0.5)) * 100)
             ra = int((-45.0 + random.gauss(0, 0.5)) * 100)
             return ((la & 0xFFFF) << 16) | (ra & 0xFFFF)
-
         if addr == RegAddr.TRIWHEEL_DUTY_CUR_FRONT:
             ld = int(random.uniform(-0.5, 0.5) * 1000)
             rd = int(random.uniform(-0.5, 0.5) * 1000)
@@ -256,16 +243,39 @@ class MockSerial:
             rd = int(random.uniform(-0.5, 0.5) * 1000)
             return ((ld & 0xFFFF) << 16) | (rd & 0xFFFF)
 
-        # ---- 角加速度计 ----
-        accel_map = {
-            RegAddr.ACCEL_LF_X: (0.02, 0.02), RegAddr.ACCEL_LF_Y: (0.02, 0.02), RegAddr.ACCEL_LF_Z: (0.98, 0.02),
-            RegAddr.ACCEL_RF_X: (0.02, 0.02), RegAddr.ACCEL_RF_Y: (0.02, 0.02), RegAddr.ACCEL_RF_Z: (0.98, 0.02),
-            RegAddr.ACCEL_LR_X: (0.02, 0.02), RegAddr.ACCEL_LR_Y: (0.02, 0.02), RegAddr.ACCEL_LR_Z: (0.98, 0.02),
-            RegAddr.ACCEL_RR_X: (0.02, 0.02), RegAddr.ACCEL_RR_Y: (0.02, 0.02), RegAddr.ACCEL_RR_Z: (0.98, 0.02),
-        }
-        if addr in accel_map:
-            mean, std = accel_map[addr]
-            return struct.unpack('<I', struct.pack('<f', mean + random.gauss(0, std)))[0]
+        # ---- 四轮加速度计 (int32, mg) ----
+        accel_mg = [
+            (RegAddr.ACCEL_LF_X, 20), (RegAddr.ACCEL_LF_Y, 20), (RegAddr.ACCEL_LF_Z, 980),
+            (RegAddr.ACCEL_RF_X, 20), (RegAddr.ACCEL_RF_Y, 20), (RegAddr.ACCEL_RF_Z, 980),
+            (RegAddr.ACCEL_LR_X, 20), (RegAddr.ACCEL_LR_Y, 20), (RegAddr.ACCEL_LR_Z, 980),
+            (RegAddr.ACCEL_RR_X, 20), (RegAddr.ACCEL_RR_Y, 20), (RegAddr.ACCEL_RR_Z, 980),
+        ]
+        for a_addr, baseline in accel_mg:
+            if addr == a_addr:
+                val = int(baseline + random.gauss(0, 10))
+                return struct.unpack('<I', struct.pack('<i', val))[0]
 
-        # ---- 未定义的寄存器 ----
+        # ---- 云台 IMU ----
+        gimbal_imu = {
+            RegAddr.GIMBAL_QUAT_W: 1.0, RegAddr.GIMBAL_QUAT_X: 0.0,
+            RegAddr.GIMBAL_QUAT_Y: 0.0, RegAddr.GIMBAL_QUAT_Z: 0.0,
+            RegAddr.GIMBAL_YAW: 0.0,
+            RegAddr.GIMBAL_PITCH: math.sin(t * 1.5) * 5.0,
+            RegAddr.GIMBAL_ROLL: math.cos(t * 1.3) * 2.0,
+            RegAddr.GIMBAL_GYRO_YAW: random.gauss(0, 0.02),
+            RegAddr.GIMBAL_GYRO_PITCH: random.gauss(0, 0.02),
+            RegAddr.GIMBAL_GYRO_ROLL: random.gauss(0, 0.02),
+            RegAddr.GIMBAL_ACCEL_X: random.gauss(0, 0.01),
+            RegAddr.GIMBAL_ACCEL_Y: random.gauss(0, 0.01),
+            RegAddr.GIMBAL_ACCEL_Z: -1.0 + random.gauss(0, 0.01),
+        }
+        if addr in gimbal_imu:
+            return struct.unpack('<I', struct.pack('<f', gimbal_imu[addr]))[0]
+
+        if addr == RegAddr.GIMBAL_DUTY_CUR:
+            gx = int(random.uniform(-0.3, 0.3) * 1000)
+            gy = int(random.uniform(-0.3, 0.3) * 1000)
+            return ((gx & 0xFFFF) << 16) | (gy & 0xFFFF)
+
+        # ---- 保留寄存器 ----
         return 0
