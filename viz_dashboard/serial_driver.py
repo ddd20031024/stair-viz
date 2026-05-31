@@ -1,6 +1,6 @@
 """串口 I/O 层：主动轮询寄存器 + 响应解析 + 连接监控。
 
-若 serial_port=None，则使用内置模拟数据源（无需硬件）。
+若 serial_port=None,则使用内置模拟数据源(无需硬件)。
 """
 
 import threading
@@ -137,7 +137,7 @@ class SerialDriver:
     def _read_response(self, expected_data_len: int, timeout: float = 0.05) -> Optional[bytes]:
         """从串口读取响应帧，返回 data bytes 或 None。
 
-        新协议响应: DATA(4B×N) | CRC8(1B)，无帧头。
+        新协议响应: DATA(4BxN) | CRC8(1B)，无帧头。
         """
         to_read = expected_data_len + 1  # data + CRC8
         data_buf = bytearray()
@@ -220,3 +220,5 @@ class SerialDriver:
             tick += 1
             if tick >= 100:
                 tick = 0
+
+    
