@@ -1,4 +1,4 @@
-"""通信协议层：FlexWire 寄存器读写 + CRC8。
+"""通信协议层:FlexWire 寄存器读写 + CRC8。
 
 基于 TI FlexWire 协议改进，取消设备地址段，增加读取长度。
 寄存器地址 + 内容形式，每个寄存器 32-bit。
@@ -15,7 +15,7 @@ from typing import Optional, List, Tuple
 
 def crc8(data: bytes) -> int:
     """CRC-8，多项式 0x07。"""
-    crc = 0xFF
+    crc = 0
     for byte in data:
         crc ^= byte
         for _ in range(8):
@@ -55,117 +55,99 @@ CMD_WRITE = 0x02     # 写命令
 # ============================================================
 
 class RegAddr(IntEnum):
-    """寄存器地址枚举。所有地址均为十进制整数值，对应 MCU 固件协议。"""
+    """Register addresses from read_notes/上下位机通信.xlsx."""
 
-    # ---- 控制寄存器 (r/w) ----
-    CTRL = 0                # 0x00  全局配置
-    DRIVE_SPEED = 1         # 0x01  驱动轮目标速度
-    DRIVE_ACCEL = 2         # 0x02  驱动轮加速度
-    LEFT_DRIVE_PID = 3      # 0x03  左驱动轮 PID
-    RIGHT_DRIVE_PID = 4     # 0x04  右驱动轮 PID
-    DRIVE_FF_TORQUE = 5     # 0x05  前馈扭矩
-    OPENLOOP_TORQUE = 6     # 0x06  开环目标扭矩
-    TRIWHEEL_ANGLE_FRONT = 7   # 0x07  前三角轮目标角度
-    TRIWHEEL_ANGLE_REAR = 8    # 0x08  后三角轮目标角度
-    TRIWHEEL_DUTY_FRONT = 9    # 0x09  前三角轮目标占空比
-    TRIWHEEL_DUTY_REAR = 10    # 0x0A  后三角轮目标占空比
+    CTRL = 0x00
+    DRIVE_SPEED = 0x01
+    DRIVE_ACCEL = 0x02
+    LEFT_DRIVE_PID = 0x03
+    RIGHT_DRIVE_PID = 0x04
+    DRIVE_FF_TORQUE = 0x05
+    OPENLOOP_TORQUE = 0x06
+    TRIWHEEL_ANGLE_FRONT = 0x07
+    TRIWHEEL_ANGLE_REAR = 0x08
+    TRIWHEEL_DUTY_FRONT = 0x09
+    TRIWHEEL_DUTY_REAR = 0x10
 
-    # ---- 云台控制 (r/w) ----
-    GIMBAL_DUTY = 11        # 0x0B  云台 X/Y 目标占空比
+    GIMBAL_DUTY = 0x11
+    RESERVED_12 = 0x12
+    RESERVED_13 = 0x13
+    RESERVED_14 = 0x14
+    RESERVED_15 = 0x15
+    RESERVED_16 = 0x16
 
-    # ---- 保留 (r) ----
-    RESERVED_12 = 12        # 0x0C
-    RESERVED_13 = 13        # 0x0D
-    RESERVED_14 = 14        # 0x0E
-    RESERVED_15 = 15        # 0x0F
-    RESERVED_16 = 16        # 0x10
+    TOF1 = 0x17
+    TOF2 = 0x18
+    TOF3 = 0x19
+    TOF4 = 0x20
 
-    # ---- TOF 传感器 (r) ----
-    TOF1 = 17               # 0x11
-    TOF2 = 18               # 0x12
-    TOF3 = 19               # 0x13
-    TOF4 = 20               # 0x14
+    IMU_QUAT_W = 0x21
+    IMU_QUAT_X = 0x22
+    IMU_QUAT_Y = 0x23
+    IMU_QUAT_Z = 0x24
+    IMU_YAW = 0x25
+    IMU_PITCH = 0x26
+    IMU_ROLL = 0x27
+    IMU_GYRO_YAW = 0x28
+    IMU_GYRO_PITCH = 0x29
+    IMU_GYRO_ROLL = 0x30
+    IMU_ACCEL_X = 0x31
+    IMU_ACCEL_Y = 0x32
+    IMU_ACCEL_Z = 0x33
+    IMU_TEMP = 0x34
 
-    # ---- 底盘 IMU (r) ----
-    IMU_QUAT_W = 21         # 0x15
-    IMU_QUAT_X = 22         # 0x16
-    IMU_QUAT_Y = 23         # 0x17
-    IMU_QUAT_Z = 24         # 0x18
-    IMU_YAW = 25            # 0x19
-    IMU_PITCH = 26          # 0x1A
-    IMU_ROLL = 27           # 0x1B
-    IMU_GYRO_YAW = 28       # 0x1C
-    IMU_GYRO_PITCH = 29     # 0x1D
-    IMU_GYRO_ROLL = 30      # 0x1E
-    IMU_ACCEL_X = 31        # 0x1F
-    IMU_ACCEL_Y = 32        # 0x20
-    IMU_ACCEL_Z = 33        # 0x21
-    IMU_TEMP = 34           # 0x22
+    MOTOR_L3_TORQUE_SPEED = 0x35
+    MOTOR_L3_ANGLE = 0x36
+    MOTOR_L4_TORQUE_SPEED = 0x37
+    MOTOR_L4_ANGLE = 0x38
+    MOTOR_L5_TORQUE_SPEED = 0x39
+    MOTOR_L5_ANGLE = 0x40
+    MOTOR_R0_TORQUE_SPEED = 0x41
+    MOTOR_R0_ANGLE = 0x42
+    MOTOR_R1_TORQUE_SPEED = 0x43
+    MOTOR_R1_ANGLE = 0x44
+    MOTOR_R2_TORQUE_SPEED = 0x45
+    MOTOR_R2_ANGLE = 0x46
 
-    # ---- 左驱动电机反馈 (r) ----
-    MOTOR_L3_TORQUE_SPEED = 35  # 0x23  左 ID3: 扭矩+速度
-    MOTOR_L3_ANGLE = 36         # 0x24  左 ID3: 总角度
-    MOTOR_L4_TORQUE_SPEED = 37  # 0x25  左 ID4
-    MOTOR_L4_ANGLE = 38         # 0x26
-    MOTOR_L5_TORQUE_SPEED = 39  # 0x27  左 ID5
-    MOTOR_L5_ANGLE = 40         # 0x28
+    TRIWHEEL_ANGLE_CUR_FRONT = 0x47
+    TRIWHEEL_ANGLE_CUR_REAR = 0x48
+    TRIWHEEL_DUTY_CUR_FRONT = 0x49
+    TRIWHEEL_DUTY_CUR_REAR = 0x50
 
-    # ---- 右驱动电机反馈 (r) ----
-    MOTOR_R0_TORQUE_SPEED = 41  # 0x29  右 ID0: 扭矩+速度
-    MOTOR_R0_ANGLE = 42         # 0x2A  右 ID0: 总角度
-    MOTOR_R1_TORQUE_SPEED = 43  # 0x2B  右 ID1
-    MOTOR_R1_ANGLE = 44         # 0x2C
-    MOTOR_R2_TORQUE_SPEED = 45  # 0x2D  右 ID2
-    MOTOR_R2_ANGLE = 46         # 0x2E
+    ACCEL_LF_X = 0x51
+    ACCEL_LF_Y = 0x52
+    ACCEL_LF_Z = 0x53
+    ACCEL_RF_X = 0x54
+    ACCEL_RF_Y = 0x55
+    ACCEL_RF_Z = 0x56
+    ACCEL_LR_X = 0x57
+    ACCEL_LR_Y = 0x58
+    ACCEL_LR_Z = 0x59
+    ACCEL_RR_X = 0x60
+    ACCEL_RR_Y = 0x61
+    ACCEL_RR_Z = 0x62
 
-    # ---- 三角轮反馈 (r) ----
-    TRIWHEEL_ANGLE_CUR_FRONT = 47   # 0x2F  前三角轮当前角度
-    TRIWHEEL_ANGLE_CUR_REAR = 48    # 0x30  后三角轮当前角度
-    TRIWHEEL_DUTY_CUR_FRONT = 49    # 0x31  前三角轮当前占空比
-    TRIWHEEL_DUTY_CUR_REAR = 50     # 0x32  后三角轮当前占空比
+    GIMBAL_QUAT_W = 0x63
+    GIMBAL_QUAT_X = 0x64
+    GIMBAL_QUAT_Y = 0x65
+    GIMBAL_QUAT_Z = 0x66
+    GIMBAL_YAW = 0x67
+    GIMBAL_PITCH = 0x68
+    GIMBAL_ROLL = 0x69
+    GIMBAL_GYRO_YAW = 0x70
+    GIMBAL_GYRO_PITCH = 0x71
+    GIMBAL_GYRO_ROLL = 0x72
+    GIMBAL_ACCEL_X = 0x73
+    GIMBAL_ACCEL_Y = 0x74
+    GIMBAL_ACCEL_Z = 0x75
+    GIMBAL_DUTY_CUR = 0x76
 
-    # ---- 四轮加速度计 (r) ----
-    ACCEL_LF_X = 51         # 0x33  左前 X
-    ACCEL_LF_Y = 52         # 0x34  左前 Y
-    ACCEL_LF_Z = 53         # 0x35  左前 Z
-    ACCEL_RF_X = 54         # 0x36  右前 X
-    ACCEL_RF_Y = 55         # 0x37  右前 Y
-    ACCEL_RF_Z = 56         # 0x38  右前 Z
-    ACCEL_LR_X = 57         # 0x39  左后 X
-    ACCEL_LR_Y = 58         # 0x3A  左后 Y
-    ACCEL_LR_Z = 59         # 0x3B  左后 Z
-    ACCEL_RR_X = 60         # 0x3C  右后 X
-    ACCEL_RR_Y = 61         # 0x3D  右后 Y
-    ACCEL_RR_Z = 62         # 0x3E  右后 Z
-
-    # ---- 云台 IMU 反馈 (r) ----
-    GIMBAL_QUAT_W = 63      # 0x3F  云台四元数 W
-    GIMBAL_QUAT_X = 64      # 0x40  云台四元数 X
-    GIMBAL_QUAT_Y = 65      # 0x41  云台四元数 Y
-    GIMBAL_QUAT_Z = 66      # 0x42  云台四元数 Z
-    GIMBAL_YAW = 67         # 0x43  云台欧拉角 Yaw
-    GIMBAL_PITCH = 68       # 0x44  云台欧拉角 Pitch
-    GIMBAL_ROLL = 69        # 0x45  云台欧拉角 Roll
-    GIMBAL_GYRO_YAW = 70    # 0x46  云台角速度 Yaw
-    GIMBAL_GYRO_PITCH = 71  # 0x47  云台角速度 Pitch
-    GIMBAL_GYRO_ROLL = 72   # 0x48  云台角速度 Roll
-    GIMBAL_ACCEL_X = 73     # 0x49  云台加速度 X
-    GIMBAL_ACCEL_Y = 74     # 0x4A  云台加速度 Y
-    GIMBAL_ACCEL_Z = 75     # 0x4B  云台加速度 Z
-
-    # ---- 云台占空比反馈 (r) ----
-    GIMBAL_DUTY_CUR = 76    # 0x4C  云台当前占空比 X/Y
-
-    # ---- 保留 (r) ----
-    RESERVED_77 = 77        # 0x4D
-    RESERVED_78 = 78        # 0x4E
-    RESERVED_79 = 79        # 0x4F
-    RESERVED_80 = 80        # 0x50
-    RESERVED_81 = 81        # 0x51
-
-    # ---- 在线状态位图 (r) ----
-    ONLINE_STATUS = 82      # 0x52
-
+    RESERVED_77 = 0x77
+    RESERVED_78 = 0x78
+    RESERVED_79 = 0x79
+    RESERVED_80 = 0x80
+    RESERVED_81 = 0x81
+    ONLINE_STATUS = 0x82
 
 # ============================================================
 # 寄存器字段定义

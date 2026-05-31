@@ -61,6 +61,7 @@ mcu_state = {
 event_queue = []   # (timestamp, event_dict)
 
 _state_lock = threading.Lock()
+_driver = None
 
 
 # ============================================================
@@ -285,6 +286,25 @@ async def index():
         return HTMLResponse(f.read())
 
 
+@app.get("/debug/state")
+async def debug_state():
+    with _state_lock:
+        state_snapshot = {
+            "mcu_connected": mcu_state["mcu_connected"],
+            "total_responses": mcu_state["total_responses"],
+            "crc_errors": mcu_state["crc_errors"],
+            "status": dict(mcu_state["status"]),
+            "tof": [dict(t) for t in mcu_state["tof"]],
+        }
+
+    driver = _driver
+    return {
+        "state": state_snapshot,
+        "driver": driver.diagnostics() if driver else None,
+        "ws_clients": len(_ws_clients),
+    }
+
+
 # WebSocket 广播
 _ws_clients: list = []
 
@@ -361,6 +381,8 @@ async def websocket_endpoint(ws: WebSocket):
 # ============================================================
 
 def main():
+    global _driver
+
     parser = argparse.ArgumentParser(description="上位机可视化服务")
     parser.add_argument("--port", type=str, default=None, help="串口设备路径（如 /dev/ttyACM0），不指定则使用模拟数据")
     parser.add_argument("--baud", type=int, default=921600)
@@ -370,6 +392,7 @@ def main():
 
     from viz_dashboard.serial_driver import SerialDriver
     driver = SerialDriver(port=args.port, baud_rate=args.baud)
+    _driver = driver
     driver.on_registers = _update_state
     driver.on_connected_changed = _update_connection
     driver.start()
@@ -380,7 +403,10 @@ def main():
         print("[模拟模式] 使用内置模拟数据源，打开 http://localhost:8080")
 
     import uvicorn
-    uvicorn.run(app, host=args.host, port=args.web_port, log_level="info")
+    try:
+        uvicorn.run(app, host=args.host, port=args.web_port, log_level="info")
+    finally:
+        driver.stop()
 
 
 if __name__ == "__main__":
